@@ -59,6 +59,18 @@ class AnthropicMessagesAdapter:
         """
         mlx_messages = []
 
+        # Tool use guidance for better agentic behavior
+        # This helps smaller models use tools more effectively
+        tool_guidance = """
+IMPORTANT TOOL USE GUIDELINES:
+1. ALWAYS use Read tool BEFORE Edit - never edit a file you haven't read
+2. Use Edit with SMALL, SURGICAL changes - only the exact lines that need to change
+3. NEVER output entire file contents in your response - use Write or Edit tools instead
+4. Break complex tasks into steps using TodoWrite
+5. One tool call at a time, verify each works before proceeding
+6. For Edit: old_string must match EXACTLY (including whitespace)
+"""
+
         # Convert system prompt to system message if present
         if system:
             system_content = ""
@@ -67,6 +79,9 @@ class AnthropicMessagesAdapter:
             else:
                 # List of SystemTextBlock
                 system_content = "\n".join(block.text for block in system)
+
+            # Prepend tool guidance to system prompt
+            system_content = tool_guidance + "\n\n" + system_content
 
             mlx_messages.append(
                 {
