@@ -136,6 +136,34 @@ class ChatGenerator:
             draft_model_id=draft_model_id,
         )
 
+    @classmethod
+    def get_if_loaded(
+        cls,
+        model_id: str,
+        adapter_path: Optional[str] = None,
+        draft_model_id: Optional[str] = None,
+    ) -> Optional["ChatGenerator"]:
+        """Get ChatGenerator only if already loaded in cache.
+
+        Unlike get_or_create, this will NOT load the model if not cached.
+        Returns None if model is not loaded.
+
+        Args:
+            model_id: Model name/path (HuggingFace model ID or local path)
+            adapter_path: Optional path to LoRA adapter
+            draft_model_id: Optional draft model name/path for speculative decoding
+
+        Returns:
+            Cached ChatGenerator instance or None if not loaded
+        """
+        from .wrapper_cache import wrapper_cache
+
+        return wrapper_cache.get_cached_only(
+            model_id=model_id,
+            adapter_path=adapter_path,
+            draft_model_id=draft_model_id,
+        )
+
     @property
     def prompt_cache(self):
         """Lazy initialization of prompt cache."""

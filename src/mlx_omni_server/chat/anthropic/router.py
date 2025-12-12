@@ -122,12 +122,26 @@ async def create_message(raw_request: Request):
         logger.error(f"Failed to parse request: {e}")
         raise
 
-    anthropic_model = _create_anthropic_model(
-        request.model,
-        # Extract extra params if needed - for now use defaults
-        None,  # adapter_path
-        None,  # draft_model
-    )
+    try:
+        anthropic_model = _create_anthropic_model(
+            request.model,
+            # Extract extra params if needed - for now use defaults
+            None,  # adapter_path
+            None,  # draft_model
+        )
+    except ModelNotLoadedError as e:
+        flog.error(f"Model not loaded: {e}")
+        logger.error(f"Model not loaded: {e}")
+        return JSONResponse(
+            content={
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": str(e)
+                }
+            },
+            status_code=400
+        )
 
     if not request.stream:
         flog.debug(f"Non-streaming request: model={request.model}, max_tokens={request.max_tokens}")
@@ -222,23 +236,67 @@ async def create_message(raw_request: Request):
     )
 
 
+class ModelNotLoadedError(Exception):
+    """Raised when requested model is not loaded in cache."""
+    pass
+
+
 def _create_anthropic_model(
     model_id: str,
     adapter_path: Optional[str] = None,
     draft_model: Optional[str] = None,
+    require_loaded: bool = True,
 ) -> AnthropicMessagesAdapter:
     """Create an Anthropic Messages adapter based on the model parameters.
 
     Uses the shared wrapper cache to get or create ChatGenerator instance.
     This avoids expensive model reloading when the same model configuration
     is used across different requests or API endpoints.
+
+    Args:
+        model_id: Model name/path
+        adapter_path: Optional LoRA adapter path
+        draft_model: Optional draft model for speculative decoding
+        require_loaded: If True (default), raise error if model not already loaded.
+                       This prevents concurrent model loading which crashes Metal.
     """
-    # Get cached or create new ChatGenerator
-    wrapper = ChatGenerator.get_or_create(
-        model_id=model_id,
-        adapter_path=adapter_path,
-        draft_model_id=draft_model,
-    )
+    # IMPORTANT: Resolve alias FIRST before checking if loaded
+    # This allows aliases like "claude-haiku-*" to map to loaded models
+    try:
+        from patches import resolve_alias, get_draft_model_for, reload_aliases
+        # Reload aliases to pick up any changes made via API
+        reload_aliases()
+        original_model_id = model_id
+        model_id = resolve_alias(model_id)
+        if model_id != original_model_id:
+            logger.info(f"Resolved alias '{original_model_id}' -> '{model_id}'")
+        # Also get draft model from config if not provided
+        if draft_model is None:
+            draft_model = get_draft_model_for(original_model_id)
+            if draft_model:
+                draft_model = resolve_alias(draft_model)
+    except ImportError:
+        pass  # patches module not available
+
+    if require_loaded:
+        # Only get if already loaded - prevents concurrent GPU access crashes
+        wrapper = ChatGenerator.get_if_loaded(
+            model_id=model_id,
+            adapter_path=adapter_path,
+            draft_model_id=draft_model,
+        )
+        if wrapper is None:
+            raise ModelNotLoadedError(
+                f"Model '{model_id}' is not loaded. "
+                f"Load it first via POST /api/models/load?model_id={model_id}"
+            )
+    else:
+        # Legacy behavior - load model if not cached
+        wrapper = ChatGenerator.get_or_create(
+            model_id=model_id,
+            adapter_path=adapter_path,
+            draft_model_id=draft_model,
+        )
 
     # Create AnthropicMessagesAdapter with the cached wrapper directly
     return AnthropicMessagesAdapter(wrapper=wrapper)

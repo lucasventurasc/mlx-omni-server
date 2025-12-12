@@ -16,21 +16,48 @@ from mlx_omni_server.chat.openai.schema import (
 
 router = APIRouter(tags=["chat—completions"])
 
+# Global lock for MLX GPU operations - prevents Metal command buffer conflicts
+# when multiple requests try to load/run models simultaneously
+_mlx_generation_lock = threading.Lock()
+
+
+class ModelNotLoadedError(Exception):
+    """Raised when requested model is not loaded in cache."""
+    pass
+
 
 @router.post("/chat/completions", response_model=ChatCompletionResponse)
 @router.post("/v1/chat/completions", response_model=ChatCompletionResponse)
 async def create_chat_completion(request: ChatCompletionRequest):
     """Create a chat completion (non-blocking)"""
 
-    text_model = _create_text_model(
-        request.model,
-        request.get_extra_params().get("adapter_path"),
-        request.get_extra_params().get("draft_model"),
-    )
+    # Try to get model - will raise error if not loaded
+    try:
+        with _mlx_generation_lock:
+            text_model = _create_text_model(
+                request.model,
+                request.get_extra_params().get("adapter_path"),
+                request.get_extra_params().get("draft_model"),
+            )
+    except ModelNotLoadedError as e:
+        return JSONResponse(
+            content={
+                "error": {
+                    "message": str(e),
+                    "type": "invalid_request_error",
+                    "code": "model_not_loaded"
+                }
+            },
+            status_code=400
+        )
 
     if not request.stream:
         # Run synchronous generate in thread pool to avoid blocking
-        completion = await asyncio.to_thread(text_model.generate, request)
+        # Lock ensures only one generation runs at a time on GPU
+        def generate_with_lock():
+            with _mlx_generation_lock:
+                return text_model.generate(request)
+        completion = await asyncio.to_thread(generate_with_lock)
         return JSONResponse(content=completion.model_dump(exclude_none=True))
 
     # For streaming, use a queue to pass chunks from sync generator to async
@@ -39,11 +66,13 @@ async def create_chat_completion(request: ChatCompletionRequest):
         done_sentinel = object()
 
         def sync_generator():
-            try:
-                for chunk in text_model.generate_stream(request):
-                    chunk_queue.put(chunk)
-            finally:
-                chunk_queue.put(done_sentinel)
+            # Hold lock during entire generation to prevent concurrent GPU access
+            with _mlx_generation_lock:
+                try:
+                    for chunk in text_model.generate_stream(request):
+                        chunk_queue.put(chunk)
+                finally:
+                    chunk_queue.put(done_sentinel)
 
         # Start sync generator in background thread
         thread = threading.Thread(target=sync_generator, daemon=True)
@@ -79,19 +108,60 @@ def _create_text_model(
     model_id: str,
     adapter_path: Optional[str] = None,
     draft_model: Optional[str] = None,
+    require_loaded: bool = True,
 ) -> OpenAIAdapter:
     """Create a text model based on the model parameters.
 
     Uses the shared wrapper cache to get or create ChatGenerator instance.
     This avoids expensive model reloading when the same model configuration
     is used across different requests or API endpoints.
+
+    Args:
+        model_id: Model name/path
+        adapter_path: Optional LoRA adapter path
+        draft_model: Optional draft model for speculative decoding
+        require_loaded: If True (default), raise error if model not already loaded.
+                       This prevents concurrent model loading which crashes Metal.
     """
-    # Get cached or create new ChatGenerator
-    wrapper = ChatGenerator.get_or_create(
-        model_id=model_id,
-        adapter_path=adapter_path,
-        draft_model_id=draft_model,
-    )
+    # IMPORTANT: Resolve alias FIRST before checking if loaded
+    # This allows aliases like "claude-haiku-*" to map to loaded models
+    try:
+        import logging
+        logger = logging.getLogger(__name__)
+        from patches import resolve_alias, get_draft_model_for, reload_aliases
+        # Reload aliases to pick up any changes made via API
+        reload_aliases()
+        original_model_id = model_id
+        model_id = resolve_alias(model_id)
+        if model_id != original_model_id:
+            logger.info(f"Resolved alias '{original_model_id}' -> '{model_id}'")
+        # Also get draft model from config if not provided
+        if draft_model is None:
+            draft_model = get_draft_model_for(original_model_id)
+            if draft_model:
+                draft_model = resolve_alias(draft_model)
+    except ImportError:
+        pass  # patches module not available
+
+    if require_loaded:
+        # Only get if already loaded - prevents concurrent GPU access crashes
+        wrapper = ChatGenerator.get_if_loaded(
+            model_id=model_id,
+            adapter_path=adapter_path,
+            draft_model_id=draft_model,
+        )
+        if wrapper is None:
+            raise ModelNotLoadedError(
+                f"Model '{model_id}' is not loaded. "
+                f"Load it first via POST /api/models/load?model_id={model_id}"
+            )
+    else:
+        # Legacy behavior - load model if not cached
+        wrapper = ChatGenerator.get_or_create(
+            model_id=model_id,
+            adapter_path=adapter_path,
+            draft_model_id=draft_model,
+        )
 
     # Create OpenAIAdapter with the cached wrapper directly
     return OpenAIAdapter(wrapper=wrapper)

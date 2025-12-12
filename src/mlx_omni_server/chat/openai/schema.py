@@ -106,6 +106,7 @@ class ChatCompletionUsage(BaseModel):
     completion_tokens: int
     total_tokens: int
     prompt_tokens_details: Optional[PromptTokensDetails] = None
+    tokens_per_second: Optional[float] = None  # Generation speed (tok/s)
 
 
 class ChatCompletionChoice(BaseModel):

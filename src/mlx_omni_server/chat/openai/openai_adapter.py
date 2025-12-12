@@ -201,6 +201,7 @@ class OpenAIAdapter:
                     + result.stats.completion_tokens
                     + cached_tokens,
                     prompt_tokens_details=prompt_tokens_details,
+                    tokens_per_second=result.stats.generation_tps,
                 ),
             )
         except Exception as e:
@@ -404,6 +405,7 @@ class OpenAIAdapter:
                         + result.stats.completion_tokens
                         + cached_tokens,
                         prompt_tokens_details=prompt_tokens_details,
+                        tokens_per_second=result.stats.generation_tps,
                     ),
                 )
 

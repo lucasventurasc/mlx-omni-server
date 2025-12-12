@@ -136,6 +136,35 @@ class MLXWrapperCache:
             self._cleanup_thread = None
             logger.info("Background cleanup thread stopped")
 
+    def get_cached_only(
+        self,
+        model_id: str,
+        adapter_path: Optional[str] = None,
+        draft_model_id: Optional[str] = None,
+    ) -> Optional[ChatGenerator]:
+        """Get ChatGenerator only if already cached. Does not load model.
+
+        Args:
+            model_id: Model name/path (HuggingFace model ID or local path)
+            adapter_path: Optional path to LoRA adapter
+            draft_model_id: Optional draft model name/path for speculative decoding
+
+        Returns:
+            Cached ChatGenerator instance or None if not loaded
+        """
+        key = WrapperCacheKey(
+            model_id=model_id,
+            adapter_path=adapter_path,
+            draft_model_id=draft_model_id,
+        )
+
+        with self._lock:
+            self._evict_expired_items()
+            if key in self._cache:
+                self._update_access_time(key)
+                return self._cache[key]
+        return None
+
     def get_wrapper(
         self,
         model_id: str,
