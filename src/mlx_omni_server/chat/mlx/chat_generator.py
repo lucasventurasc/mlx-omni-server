@@ -140,9 +140,14 @@ class ChatGenerator:
     def prompt_cache(self):
         """Lazy initialization of prompt cache."""
         if self._prompt_cache is None:
-            from .prompt_cache import PromptCache
+            # Use SmartPromptCache for better cache hit rates with Claude Code
+            from .smart_prompt_cache import SmartPromptCache
 
-            self._prompt_cache = PromptCache()
+            self._prompt_cache = SmartPromptCache(
+                max_slots=4,       # Keep 4 different prompt caches
+                block_size=256,    # 256 tokens per block for hashing
+                min_reuse_tokens=512,  # Minimum tokens to consider a hit
+            )
         return self._prompt_cache
 
     @property
@@ -196,7 +201,7 @@ class ChatGenerator:
             **template_kwargs,
         )
 
-        logger.debug(f"Encoded prompt: {prompt}")
+        # logger.debug(f"Encoded prompt: {prompt}")
         return prompt
 
     def _create_mlx_kwargs(
@@ -344,7 +349,10 @@ class ChatGenerator:
             if final_stream_result is None:
                 raise RuntimeError("No tokens generated")
 
-            logger.info(f"Model Response:\n{complete_raw_text}")
+            # Log generation stats
+            stats = final_stream_result.stats
+            logger.info(f"Generation complete: {stats.completion_tokens} tokens @ {stats.generation_tps:.1f} tks/s")
+            # logger.debug(f"Model Response:\n{complete_raw_text}")
             chat_result = self.chat_template.parse_chat_response(complete_raw_text)
 
             # Determine appropriate finish_reason
@@ -421,15 +429,23 @@ class ChatGenerator:
 
             # Tokenize prompt
             tokenized_prompt = self.tokenizer.encode(prompt)
+            total_prompt_tokens = len(tokenized_prompt)
 
             # Process cache if enabled
             processed_prompt = tokenized_prompt
             cached_tokens = 0
+            prompt_cache_obj = None
 
             if enable_prompt_cache:
-                processed_prompt, cached_tokens = self.prompt_cache.get_prompt_cache(
+                processed_prompt, cached_tokens, prompt_cache_obj = self.prompt_cache.get_prompt_cache(
                     self.model, tokenized_prompt
                 )
+
+            tokens_to_process = len(processed_prompt)
+            if cached_tokens > 0:
+                logger.info(f"Prefill: {tokens_to_process} tokens (cache hit: {cached_tokens}/{total_prompt_tokens})")
+            else:
+                logger.info(f"Prefill: {tokens_to_process} tokens...")
 
             # Create MLX kwargs
             mlx_kwargs = self._create_mlx_kwargs(
@@ -439,8 +455,8 @@ class ChatGenerator:
             )
 
             # Add cache to kwargs if available
-            if enable_prompt_cache and self.prompt_cache.cache:
-                mlx_kwargs["prompt_cache"] = self.prompt_cache.cache
+            if enable_prompt_cache and prompt_cache_obj:
+                mlx_kwargs["prompt_cache"] = prompt_cache_obj
 
             # Stream generation
             generated_tokens = []
@@ -460,6 +476,7 @@ class ChatGenerator:
                 # Record first token time if this is the first token
                 if first_token_time is None:
                     first_token_time = time.perf_counter() - request_start_time
+                    logger.info(f"Generating... (TTFT: {first_token_time:.2f}s)")
 
                 # Process logprobs if requested
                 logprobs = None

@@ -69,28 +69,44 @@ class OpenAIAdapter:
                 template_kwargs[key] = extra_params[key]
 
         # Convert messages to dict format
-        messages = [
-            {
-                "role": (
-                    msg.role.value if hasattr(msg.role, "value") else str(msg.role)
-                ),
+        messages = []
+        for msg in request.messages:
+            role = msg.role.value if hasattr(msg.role, "value") else str(msg.role)
+            msg_dict = {
+                "role": role,
                 "content": msg.content,
-                **({"name": msg.name} if msg.name else {}),
-                **({"tool_calls": msg.tool_calls} if msg.tool_calls else {}),
             }
-            for msg in request.messages
-        ]
+            if msg.name:
+                msg_dict["name"] = msg.name
+            if msg.tool_calls:
+                # Convert tool_calls to pure dicts with JSON serialization (for enum conversion)
+                # Also parse arguments from JSON string to dict for templates that expect dict
+                import json as json_module
+                tool_calls_list = []
+                for tc in msg.tool_calls:
+                    tc_dict = tc.model_dump(mode='json') if hasattr(tc, "model_dump") else (dict(tc) if hasattr(tc, "__dict__") else tc)
+                    # Parse arguments JSON string to dict if needed
+                    if 'function' in tc_dict and isinstance(tc_dict['function'].get('arguments'), str):
+                        try:
+                            tc_dict['function']['arguments'] = json_module.loads(tc_dict['function']['arguments'])
+                        except (json_module.JSONDecodeError, TypeError):
+                            pass  # Keep as string if parsing fails
+                    tool_calls_list.append(tc_dict)
+                msg_dict["tool_calls"] = tool_calls_list
+            if msg.tool_call_id:
+                msg_dict["tool_call_id"] = msg.tool_call_id
+            messages.append(msg_dict)
 
-        # Convert tools to dict format
+        # Convert tools to dict format with JSON serialization (for enum conversion)
         tools = None
         if request.tools:
             tools = [
-                tool.model_dump() if hasattr(tool, "model_dump") else dict(tool)
+                tool.model_dump(mode='json') if hasattr(tool, "model_dump") else dict(tool)
                 for tool in request.tools
             ]
 
-        logger.info(f"messages: {messages}")
-        logger.info(f"template_kwargs: {template_kwargs}")
+        # logger.debug(f"messages: {messages}")
+        # logger.debug(f"template_kwargs: {template_kwargs}")
 
         json_schema = None
         if request.response_format and request.response_format.json_schema:
@@ -120,26 +136,37 @@ class OpenAIAdapter:
             # Directly use wrapper's generate method for complete response
             result = self._generate_wrapper.generate(**params)
 
-            logger.debug(f"Model Response:\n{result.content.text}")
+            # logger.debug(f"Model Response:\n{result.content.text}")
 
             # Use reasoning from the wrapper's result
             final_content = result.content.text
             reasoning_content = result.content.reasoning
 
-            # Use wrapper's chat tokenizer for tool processing
-            if request.tools:
-                message = ChatMessage(
-                    role=Role.ASSISTANT,
-                    content=final_content,
-                    tool_calls=result.content.tool_calls,
-                    reasoning=reasoning_content,
-                )
-            else:
-                message = ChatMessage(
-                    role=Role.ASSISTANT,
-                    content=final_content,
-                    reasoning=reasoning_content,
-                )
+            # Include tool_calls in response if present (from request.tools OR parsed from content)
+            # Convert from internal ToolCall format to OpenAI schema format
+            schema_tool_calls = None
+            if result.content.tool_calls:
+                import json as json_module
+                from .schema import ToolCall as SchemaToolCall, FunctionCall, ToolType
+
+                schema_tool_calls = [
+                    SchemaToolCall(
+                        id=tc.id,
+                        type=ToolType.FUNCTION,
+                        function=FunctionCall(
+                            name=tc.name,
+                            arguments=json_module.dumps(tc.arguments) if tc.arguments else "{}"
+                        )
+                    )
+                    for tc in result.content.tool_calls
+                ]
+
+            message = ChatMessage(
+                role=Role.ASSISTANT,
+                content=final_content,
+                tool_calls=schema_tool_calls,
+                reasoning=reasoning_content,
+            )
 
             # Use cached tokens from wrapper stats
             cached_tokens = result.stats.cache_hit_tokens
@@ -192,34 +219,154 @@ class OpenAIAdapter:
             params = self._prepare_generation_params(request)
 
             result = None
+            accumulated_text = ""  # Accumulate all text for tool parsing at end
+            buffer = ""  # Buffer for detecting tool call start
+            in_tool_call = False  # Flag to stop streaming once tool call detected
+
+            # Tool call markers to detect
+            TOOL_MARKERS = ['<tool_call>', '<function=']
+            MAX_MARKER_LEN = max(len(m) for m in TOOL_MARKERS)
+
             for chunk in self._generate_wrapper.generate_stream(**params):
                 created = int(time.time())
 
-                # TODO: support streaming tools parse
-                # For streaming, we need to get the appropriate delta content
+                # For streaming, get the delta content
                 if chunk.content.text_delta:
                     content = chunk.content.text_delta
+                    accumulated_text += content
                 elif chunk.content.reasoning_delta:
                     content = chunk.content.reasoning_delta
                 else:
                     content = ""
 
-                message = ChatMessage(role=Role.ASSISTANT, content=content)
+                # Smart buffering to hide tool call XML
+                if content and not in_tool_call:
+                    buffer += content
 
-                yield ChatCompletionChunk(
-                    id=chat_id,
-                    created=created,
-                    model=request.model,
-                    choices=[
-                        ChatCompletionChunkChoice(
-                            index=0,
-                            delta=message,
-                            finish_reason=chunk.finish_reason or "stop",
-                            logprobs=chunk.logprobs,
-                        )
-                    ],
-                )
+                    # Check if we've started a tool call
+                    for marker in TOOL_MARKERS:
+                        if marker in buffer:
+                            in_tool_call = True
+                            # Send any content before the marker
+                            marker_pos = buffer.find(marker)
+                            if marker_pos > 0:
+                                pre_marker = buffer[:marker_pos]
+                                message = ChatMessage(role=Role.ASSISTANT, content=pre_marker)
+                                yield ChatCompletionChunk(
+                                    id=chat_id,
+                                    created=created,
+                                    model=request.model,
+                                    choices=[
+                                        ChatCompletionChunkChoice(
+                                            index=0,
+                                            delta=message,
+                                            finish_reason=None,
+                                            logprobs=chunk.logprobs,
+                                        )
+                                    ],
+                                )
+                            buffer = ""
+                            break
+
+                    # If not in tool call and buffer is long enough, flush safe content
+                    if not in_tool_call and len(buffer) > MAX_MARKER_LEN:
+                        # Keep the last MAX_MARKER_LEN chars in buffer for marker detection
+                        safe_content = buffer[:-MAX_MARKER_LEN]
+                        buffer = buffer[-MAX_MARKER_LEN:]
+
+                        # Check if safe_content has '<' that could be start of tool marker
+                        # Move everything from last '<' onward back to buffer
+                        last_angle = safe_content.rfind('<')
+                        if last_angle >= 0:
+                            buffer = safe_content[last_angle:] + buffer
+                            safe_content = safe_content[:last_angle]
+
+                        if safe_content:
+                            message = ChatMessage(role=Role.ASSISTANT, content=safe_content)
+                            yield ChatCompletionChunk(
+                                id=chat_id,
+                                created=created,
+                                model=request.model,
+                                choices=[
+                                    ChatCompletionChunkChoice(
+                                        index=0,
+                                        delta=message,
+                                        finish_reason=None,
+                                        logprobs=chunk.logprobs,
+                                    )
+                                ],
+                            )
+
                 result = chunk
+
+            # Flush remaining buffer if no tool call was detected
+            # But don't flush if buffer looks like start of tool call (starts with '<')
+            if buffer and not in_tool_call:
+                # Check if buffer might be incomplete tool call
+                is_potential_tool_call = buffer.strip().startswith('<') and any(
+                    buffer.strip().startswith(m[:len(buffer.strip())])
+                    for m in TOOL_MARKERS
+                )
+                if not is_potential_tool_call:
+                    message = ChatMessage(role=Role.ASSISTANT, content=buffer)
+                    yield ChatCompletionChunk(
+                        id=chat_id,
+                        created=int(time.time()),
+                        model=request.model,
+                        choices=[
+                            ChatCompletionChunkChoice(
+                                index=0,
+                                delta=message,
+                                finish_reason=None,
+                                logprobs=None,
+                            )
+                        ],
+                    )
+
+            # After streaming completes, emit final chunk with finish_reason
+            # Check for tool calls in accumulated text
+            tool_calls = None
+            final_finish_reason = "stop"
+
+            if accumulated_text and ('<function=' in accumulated_text or '<tool_call>' in accumulated_text):
+                from mlx_omni_server.chat.mlx.tools.qwen3_moe_tools_parser import Qwen3MoeToolParser
+                import json as json_module
+                from .schema import ToolCall as SchemaToolCall, FunctionCall, ToolType
+
+                parser = Qwen3MoeToolParser()
+                parsed_tools = parser.parse_tools(accumulated_text)
+                if parsed_tools:
+                    tool_calls = [
+                        SchemaToolCall(
+                            id=tc.id,
+                            type=ToolType.FUNCTION,
+                            function=FunctionCall(
+                                name=tc.name,
+                                arguments=json_module.dumps(tc.arguments) if tc.arguments else "{}"
+                            )
+                        )
+                        for tc in parsed_tools
+                    ]
+                    final_finish_reason = "tool_calls"
+
+            # Always emit a final chunk with finish_reason
+            yield ChatCompletionChunk(
+                id=chat_id,
+                created=int(time.time()),
+                model=request.model,
+                choices=[
+                    ChatCompletionChunkChoice(
+                        index=0,
+                        delta=ChatMessage(
+                            role=Role.ASSISTANT,
+                            content="",
+                            tool_calls=tool_calls
+                        ),
+                        finish_reason=final_finish_reason,
+                        logprobs=None,
+                    )
+                ],
+            )
 
             if (
                 request.stream_options

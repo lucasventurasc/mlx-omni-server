@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field, field_validator
 class MessageRole(str, Enum):
     USER = "user"
     ASSISTANT = "assistant"
+    SYSTEM = "system"  # For compatibility with Claude Code router
 
 
 class StopReason(str, Enum):
@@ -35,6 +36,13 @@ class ToolChoiceType(str, Enum):
     ANY = "any"
     NONE = "none"
     TOOL = "tool"
+
+
+# Cache Control (for prompt caching)
+class CacheControl(BaseModel):
+    """Cache control for prompt caching."""
+
+    type: Literal["ephemeral"] = "ephemeral"
 
 
 # Content Blocks
@@ -91,13 +99,80 @@ class ToolInputSchema(BaseModel):
     properties: Optional[Dict[str, Any]] = None
     required: Optional[List[str]] = None
 
+    class Config:
+        extra = "allow"  # Allow extra fields like $schema, additionalProperties
 
-class AnthropicTool(BaseModel):
-    """Tool definition for Anthropic API."""
+
+class OpenAIFunctionDef(BaseModel):
+    """OpenAI function definition (nested inside tool)."""
+
+    name: str
+    description: Optional[str] = None
+    parameters: Optional[Dict[str, Any]] = None
+
+
+class OpenAITool(BaseModel):
+    """OpenAI tool format: {type: 'function', function: {...}}"""
+
+    type: Literal["function"]
+    function: OpenAIFunctionDef
+
+
+class AnthropicToolDirect(BaseModel):
+    """Anthropic tool format: {name: '...', input_schema: {...}}"""
 
     name: str = Field(..., max_length=200, pattern=r"^[a-zA-Z0-9_-]+$")
     description: Optional[str] = None
     input_schema: ToolInputSchema
+
+
+class AnthropicTool(BaseModel):
+    """Tool definition that accepts both Anthropic and OpenAI formats.
+
+    Anthropic format: {"name": "...", "input_schema": {...}}
+    OpenAI format: {"type": "function", "function": {"name": "...", "parameters": {...}}}
+    """
+
+    name: str = Field(default="", max_length=200)
+    description: Optional[str] = None
+    input_schema: Optional[ToolInputSchema] = None
+    # OpenAI format fields
+    type: Optional[str] = None
+    function: Optional[OpenAIFunctionDef] = None
+
+    @classmethod
+    def model_validate(cls, obj: Any, *args, **kwargs):
+        """Custom validation to handle both formats."""
+        if isinstance(obj, dict):
+            # Check if this is OpenAI format
+            if obj.get("type") == "function" and "function" in obj:
+                func = obj["function"]
+                # Convert to Anthropic format
+                return cls(
+                    name=func.get("name", ""),
+                    description=func.get("description"),
+                    input_schema=ToolInputSchema(
+                        type="object",
+                        properties=func.get("parameters", {}).get("properties", {}),
+                        required=func.get("parameters", {}).get("required", []),
+                    ) if func.get("parameters") else ToolInputSchema(),
+                )
+        return super().model_validate(obj, *args, **kwargs)
+
+    def __init__(self, **data):
+        # Handle OpenAI format in constructor
+        if data.get("type") == "function" and "function" in data:
+            func = data["function"]
+            if isinstance(func, dict):
+                data["name"] = func.get("name", "")
+                data["description"] = func.get("description")
+                params = func.get("parameters", {})
+                data["input_schema"] = ToolInputSchema(
+                    type="object",
+                    properties=params.get("properties", {}),
+                    required=params.get("required", []),
+                )
+        super().__init__(**data)
 
 
 class ToolChoiceAuto(BaseModel):
@@ -154,6 +229,7 @@ class RequestTextBlock(BaseModel):
 
     type: Literal["text"] = "text"
     text: str
+    cache_control: Optional[CacheControl] = None
 
 
 class RequestImageBlock(BaseModel):
@@ -161,6 +237,7 @@ class RequestImageBlock(BaseModel):
 
     type: Literal["image"] = "image"
     source: Dict[str, Any]  # Simplified for now
+    cache_control: Optional[CacheControl] = None
 
 
 class RequestToolUseBlock(BaseModel):
@@ -181,8 +258,28 @@ class RequestToolResultBlock(BaseModel):
     is_error: Optional[bool] = False
 
 
+class RequestThinkingBlock(BaseModel):
+    """Thinking block in request (from previous assistant response)."""
+
+    type: Literal["thinking"] = "thinking"
+    thinking: str
+    signature: Optional[str] = None
+
+
+class RequestRedactedThinkingBlock(BaseModel):
+    """Redacted thinking block in request."""
+
+    type: Literal["redacted_thinking"] = "redacted_thinking"
+    data: str
+
+
 RequestContentBlock = Union[
-    RequestTextBlock, RequestImageBlock, RequestToolUseBlock, RequestToolResultBlock
+    RequestTextBlock,
+    RequestImageBlock,
+    RequestToolUseBlock,
+    RequestToolResultBlock,
+    RequestThinkingBlock,
+    RequestRedactedThinkingBlock,
 ]
 
 
@@ -199,6 +296,7 @@ class SystemTextBlock(BaseModel):
 
     type: Literal["text"] = "text"
     text: str
+    cache_control: Optional[CacheControl] = None
 
 
 SystemPrompt = Union[str, List[SystemTextBlock]]

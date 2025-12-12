@@ -311,5 +311,10 @@ class MLXWrapperCache:
 
 
 # Global cache instance - shared across all API endpoints
-# Default to 3 models with 5-minute TTL as suggested by user requirements
-wrapper_cache = MLXWrapperCache(max_size=3, ttl_seconds=300)
+# Configurable via environment variables:
+#   MLX_MODEL_CACHE_SIZE - max models in cache (default: 3)
+#   MLX_MODEL_CACHE_TTL  - TTL in seconds (default: 1800 = 30 min, 0 = disabled)
+import os
+_cache_size = int(os.environ.get("MLX_MODEL_CACHE_SIZE", "3"))
+_cache_ttl = int(os.environ.get("MLX_MODEL_CACHE_TTL", "1800"))  # 30 minutes default
+wrapper_cache = MLXWrapperCache(max_size=_cache_size, ttl_seconds=_cache_ttl)

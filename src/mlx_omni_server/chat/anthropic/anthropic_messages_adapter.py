@@ -14,7 +14,9 @@ from mlx_omni_server.chat.anthropic.anthropic_schema import (
     MessagesRequest,
     MessagesResponse,
     MessageStreamEvent,
+    RequestRedactedThinkingBlock,
     RequestTextBlock,
+    RequestThinkingBlock,
     RequestToolResultBlock,
     RequestToolUseBlock,
     StopReason,
@@ -75,6 +77,19 @@ class AnthropicMessagesAdapter:
 
         # Convert input messages
         for msg in messages:
+            # Handle system messages in the messages array (Claude Code compatibility)
+            if msg.role.value == "system":
+                # Extract content and add as system message
+                if isinstance(msg.content, str):
+                    system_text = msg.content
+                else:
+                    # List of content blocks
+                    system_text = "\n".join(
+                        block.text for block in msg.content
+                        if isinstance(block, RequestTextBlock)
+                    )
+                mlx_messages.append({"role": "system", "content": system_text})
+                continue
             mlx_msg = {
                 "role": msg.role.value,
             }
@@ -88,6 +103,13 @@ class AnthropicMessagesAdapter:
                 for block in msg.content:
                     if isinstance(block, RequestTextBlock):
                         content_parts.append(block.text)
+                    elif isinstance(block, RequestThinkingBlock):
+                        # Include thinking content as part of assistant's message
+                        # (This is from previous turn's thinking, kept for context)
+                        pass  # Skip thinking blocks - they're internal reasoning
+                    elif isinstance(block, RequestRedactedThinkingBlock):
+                        # Skip redacted thinking blocks
+                        pass
                     elif isinstance(block, RequestToolUseBlock):
                         # Handle tool use blocks
                         mlx_msg["tool_calls"] = [
@@ -118,6 +140,9 @@ class AnthropicMessagesAdapter:
 
                 if content_parts:
                     mlx_msg["content"] = "\n".join(content_parts)
+                else:
+                    # Ensure content is always present (required by Jinja template)
+                    mlx_msg["content"] = ""
 
             mlx_messages.append(mlx_msg)
 
@@ -174,9 +199,10 @@ class AnthropicMessagesAdapter:
         template_kwargs = {}
 
         # Handle thinking configuration
-        if request.thinking and isinstance(request.thinking, ThinkingConfigEnabled):
-            template_kwargs["enable_thinking"] = True
-            # template_kwargs["thinking_budget"] = request.thinking.budget_tokens
+        # ALWAYS disable thinking for local models - they don't support it properly
+        # Claude Code may request thinking but local models can't handle it
+        # TODO: Re-enable when local model thinking is properly supported
+        template_kwargs["enable_thinking"] = False
 
         # Prepare sampler configuration
         sampler_config = {
@@ -185,8 +211,10 @@ class AnthropicMessagesAdapter:
             "top_k": request.top_k or 0,
         }
 
-        logger.info(f"Anthropic messages: {messages}")
-        logger.info(f"Anthropic template_kwargs: {template_kwargs}")
+        logger.debug(f"Anthropic messages count: {len(messages)}")
+        logger.debug(f"Anthropic tools count: {len(tools) if tools else 0}")
+        if tools:
+            logger.debug(f"First tool: {tools[0].get('function', {}).get('name', tools[0].get('name', 'unknown'))}")
 
         params = {
             "messages": messages,
@@ -287,6 +315,11 @@ class AnthropicMessagesAdapter:
             # Generate using wrapper
             result = self._generate_wrapper.generate(**params)
 
+            # Debug logging
+            logger.info(f"Generation result: text='{result.content.text[:100] if result.content.text else 'None'}...', "
+                       f"finish_reason={result.finish_reason}, "
+                       f"output_tokens={result.stats.completion_tokens if result.stats else 0}")
+
             # Create content blocks
             content_blocks = self._create_content_blocks(
                 text_content=result.content.text,
@@ -356,8 +389,13 @@ class AnthropicMessagesAdapter:
             final_result = None
             current_block_index = 0
             in_thinking = False
+            chunk_count = 0
 
+            logger.info(f"Starting stream generation...")
             for chunk in self._generate_wrapper.generate_stream(**params):
+                chunk_count += 1
+                if chunk_count <= 3 or chunk_count % 50 == 0:
+                    logger.debug(f"Stream chunk {chunk_count}: text_delta='{chunk.content.text_delta[:50] if chunk.content.text_delta else None}'")
                 # Determine content type and send appropriate events
                 if chunk.content.reasoning_delta:
                     # Thinking content
@@ -429,12 +467,55 @@ class AnthropicMessagesAdapter:
                     ),
                 )
 
-            # End final content block
-            yield MessageStreamEvent(
-                type=StreamEventType.CONTENT_BLOCK_STOP, index=current_block_index
-            )
+            # End final content block (text or thinking)
+            if accumulated_text or accumulated_reasoning:
+                yield MessageStreamEvent(
+                    type=StreamEventType.CONTENT_BLOCK_STOP, index=current_block_index
+                )
+                current_block_index += 1
+
+            # Parse tool calls from accumulated text at end of stream
+            tool_calls = None
+            if accumulated_text:
+                chat_result = self._generate_wrapper.chat_template.parse_chat_response(
+                    accumulated_text
+                )
+                tool_calls = chat_result.tool_calls
+
+                # If we found tool calls, emit ToolUseBlock events for each
+                if tool_calls:
+                    import json as json_module
+                    for tool_call in tool_calls:
+                        # Start tool_use block with empty input (per Anthropic protocol)
+                        yield MessageStreamEvent(
+                            type=StreamEventType.CONTENT_BLOCK_START,
+                            index=current_block_index,
+                            content_block=ToolUseBlock(
+                                id=tool_call.id,
+                                name=tool_call.name,
+                                input={},
+                            ),
+                        )
+                        # Send input_json_delta with the full JSON
+                        # (Anthropic protocol allows chunked partial_json, but full JSON works too)
+                        input_json = json_module.dumps(tool_call.arguments)
+                        yield MessageStreamEvent(
+                            type=StreamEventType.CONTENT_BLOCK_DELTA,
+                            index=current_block_index,
+                            delta=StreamDelta(
+                                type="input_json_delta",
+                                partial_json=input_json,
+                            ),
+                        )
+                        # End tool_use block
+                        yield MessageStreamEvent(
+                            type=StreamEventType.CONTENT_BLOCK_STOP,
+                            index=current_block_index,
+                        )
+                        current_block_index += 1
 
             # Map stop reason and usage
+            has_tool_calls = tool_calls is not None and len(tool_calls) > 0
             if final_result:
                 cached_tokens = final_result.stats.cache_hit_tokens
                 usage = Usage(
@@ -447,11 +528,13 @@ class AnthropicMessagesAdapter:
 
                 stop_reason = self._map_finish_reason(
                     final_result.finish_reason,
-                    False,  # StreamContent doesn't have tool_calls, so always False
+                    has_tool_calls,
                 )
             else:
                 usage = Usage(input_tokens=0, output_tokens=0)
-                stop_reason = StopReason.END_TURN
+                stop_reason = StopReason.TOOL_USE if has_tool_calls else StopReason.END_TURN
+
+            logger.info(f"Stream complete: {chunk_count} chunks, tool_calls={len(tool_calls) if tool_calls else 0}, accumulated_text='{accumulated_text[:100] if accumulated_text else 'EMPTY'}...'")
 
             # Message delta event with stop reason and usage
             yield MessageStreamEvent(

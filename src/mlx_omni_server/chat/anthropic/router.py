@@ -1,8 +1,14 @@
 import json
-from typing import Generator, Optional
+import logging
+import asyncio
+import queue
+import threading
+from typing import Any, Generator, Optional, AsyncGenerator
+from pathlib import Path
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import ValidationError
 
 from mlx_omni_server.chat.anthropic.anthropic_messages_adapter import (
     AnthropicMessagesAdapter,
@@ -13,6 +19,20 @@ from .anthropic_schema import MessagesRequest, MessagesResponse
 from .models_service import AnthropicModelsService
 from .schema import AnthropicModelList
 
+logger = logging.getLogger(__name__)
+
+# File logger for debugging Claude Code requests
+_file_logger = None
+def get_file_logger():
+    global _file_logger
+    if _file_logger is None:
+        _file_logger = logging.getLogger("anthropic_debug")
+        _file_logger.setLevel(logging.DEBUG)
+        log_path = Path("/tmp/anthropic_debug.log")
+        handler = logging.FileHandler(log_path, mode='w')
+        handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
+        _file_logger.addHandler(handler)
+    return _file_logger
 router = APIRouter(tags=["anthropic"])
 models_service = AnthropicModelsService()
 
@@ -47,10 +67,60 @@ async def list_anthropic_models(
     )
 
 
-@router.post("/messages", response_model=MessagesResponse)
-@router.post("/v1/messages", response_model=MessagesResponse)
-async def create_message(request: MessagesRequest):
+@router.post("/messages/count_tokens")
+@router.post("/v1/messages/count_tokens")
+async def count_tokens(raw_request: Request):
+    """Count tokens for a messages request (stub implementation)."""
+    try:
+        body = await raw_request.json()
+        # Return a stub response - actual token counting would require tokenizer
+        # For now, estimate based on message length
+        messages = body.get("messages", [])
+        total_chars = sum(
+            len(str(m.get("content", ""))) for m in messages
+        )
+        # Rough estimate: ~4 chars per token
+        estimated_tokens = total_chars // 4 + 100  # Add base tokens for overhead
+
+        return JSONResponse(content={
+            "input_tokens": estimated_tokens
+        })
+    except Exception as e:
+        logger.error(f"Failed to count tokens: {e}")
+        return JSONResponse(content={"input_tokens": 1000})  # Fallback
+
+
+@router.post("/messages")
+@router.post("/v1/messages")
+async def create_message(raw_request: Request):
     """Create an Anthropic Messages API completion"""
+    flog = get_file_logger()
+
+    # Parse and validate request manually to get better error messages
+    try:
+        body = await raw_request.json()
+        flog.debug(f"=== NEW REQUEST ===")
+        flog.debug(f"stream: {body.get('stream')}, model: {body.get('model')}, max_tokens: {body.get('max_tokens')}")
+        flog.debug(f"messages count: {len(body.get('messages', []))}")
+        flog.debug(f"tools count: {len(body.get('tools', []))}")
+        # Log first message content (truncated)
+        if body.get('messages'):
+            first_msg = body['messages'][0]
+            content = str(first_msg.get('content', ''))[:200]
+            flog.debug(f"first message role: {first_msg.get('role')}, content: {content}...")
+        request = MessagesRequest.model_validate(body)
+    except ValidationError as e:
+        flog.error(f"Validation error: {e}")
+        logger.error(f"Validation error: {e}")
+        # Log which fields failed
+        for error in e.errors():
+            flog.error(f"  Field: {error['loc']}, Error: {error['msg']}")
+            logger.error(f"  Field: {error['loc']}, Error: {error['msg']}, Input type: {type(error.get('input'))}")
+        raise
+    except Exception as e:
+        flog.error(f"Failed to parse request: {e}")
+        logger.error(f"Failed to parse request: {e}")
+        raise
 
     anthropic_model = _create_anthropic_model(
         request.model,
@@ -60,16 +130,90 @@ async def create_message(request: MessagesRequest):
     )
 
     if not request.stream:
-        completion = anthropic_model.generate(request)
-        return JSONResponse(content=completion.model_dump(exclude_none=True))
+        flog.debug(f"Non-streaming request: model={request.model}, max_tokens={request.max_tokens}")
+        try:
+            # Run synchronous generate in thread pool to avoid blocking event loop
+            completion = await asyncio.to_thread(anthropic_model.generate, request)
+            flog.debug(f"Non-streaming success: {completion.stop_reason}")
+            return JSONResponse(content=completion.model_dump(exclude_none=True))
+        except Exception as e:
+            flog.error(f"Non-streaming generation failed: {e}")
+            # Return a minimal valid response to prevent Claude Code from hanging
+            return JSONResponse(
+                content={
+                    "id": f"msg_error",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": ""}],
+                    "model": request.model,
+                    "stop_reason": "end_turn",
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 0, "output_tokens": 0}
+                },
+                status_code=200
+            )
 
-    async def anthropic_event_generator() -> Generator[str, None, None]:
-        for event in anthropic_model.generate_stream(request):
-            yield f"event: {event.type.value}\n"
-            yield f"data: {json.dumps(event.model_dump(exclude_none=True))}\n\n"
+    flog.debug(f"Starting streaming request")
+
+    # For streaming, use a queue to pass events from sync generator to async
+    async def async_anthropic_event_generator() -> AsyncGenerator[str, None]:
+        event_queue = queue.Queue()
+        done_sentinel = object()
+        event_count = 0
+
+        def sync_generator():
+            nonlocal event_count
+            try:
+                for event in anthropic_model.generate_stream(request):
+                    event_queue.put(event)
+                    event_count += 1
+            finally:
+                event_queue.put(done_sentinel)
+
+        # Start sync generator in background thread
+        thread = threading.Thread(target=sync_generator, daemon=True)
+        thread.start()
+
+        # Yield events as they arrive (non-blocking)
+        local_count = 0
+        while True:
+            try:
+                # Poll queue with small timeout to stay async-friendly
+                event = await asyncio.to_thread(event_queue.get, timeout=0.1)
+                if event is done_sentinel:
+                    break
+
+                local_count += 1
+                # Use mode='json' to properly serialize enums to their string values
+                event_data = event.model_dump(mode='json', exclude_none=True)
+
+                # For message_start and message_delta, ensure stop_reason/stop_sequence are included as null
+                if event.type.value == "message_start" and "message" in event_data:
+                    event_data["message"].setdefault("stop_reason", None)
+                    event_data["message"].setdefault("stop_sequence", None)
+                elif event.type.value == "message_delta" and "delta" in event_data:
+                    event_data["delta"].setdefault("stop_sequence", None)
+
+                # Log important events
+                if event.type.value in ["message_start", "message_delta", "message_stop"]:
+                    logger.info(f"SSE [{local_count}] {event.type.value}: {json.dumps(event_data)[:200]}")
+                elif event.type.value == "content_block_start":
+                    logger.info(f"SSE [{local_count}] content_block_start: {event.content_block}")
+                elif event.type.value == "content_block_delta" and local_count <= 3:
+                    logger.info(f"SSE [{local_count}] content_block_delta: {json.dumps(event_data)}")
+
+                yield f"event: {event.type.value}\n"
+                yield f"data: {json.dumps(event_data)}\n\n"
+            except queue.Empty:
+                # No event yet, yield control to event loop
+                await asyncio.sleep(0)
+                continue
+
+        logger.info(f"SSE stream finished with {local_count} events")
+        thread.join(timeout=1.0)
 
     return StreamingResponse(
-        anthropic_event_generator(),
+        async_anthropic_event_generator(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

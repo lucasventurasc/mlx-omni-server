@@ -76,11 +76,18 @@ class ChatTemplate(ABC):
                 )
             conversation.append(msg_dict)
 
-        if kwargs:
-            self.enable_thinking_parse = kwargs.pop("enable_thinking_parse", None)
-            skip_thinking_prefill = kwargs.pop("skip_thinking_prefill", False)
+        # Always reset enable_thinking_parse for each request
+        # Use sentinel to detect if it was explicitly passed
+        _not_provided = object()
+        thinking_value = kwargs.pop("enable_thinking_parse", _not_provided) if kwargs else _not_provided
+        skip_thinking_prefill = kwargs.pop("skip_thinking_prefill", False) if kwargs else False
+
+        if thinking_value is not _not_provided:
+            # Explicitly provided - use the value (could be True, False, or None)
+            self.enable_thinking_parse = thinking_value
         else:
-            skip_thinking_prefill = False
+            # Not provided - reset to None for auto-detection
+            self.enable_thinking_parse = None
 
         if should_prefill:
             prompt = self.tokenizer.apply_chat_template(
