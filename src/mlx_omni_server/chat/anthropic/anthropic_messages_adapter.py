@@ -205,14 +205,26 @@ class AnthropicMessagesAdapter:
         template_kwargs["enable_thinking"] = False
 
         # Prepare sampler configuration
-        sampler_config = {
-            "temp": request.temperature or 1.0,
-            "top_p": request.top_p or 1.0,
-            "top_k": request.top_k or 0,
-        }
+        # Use global settings from UI as defaults, with request values taking precedence
+        try:
+            from extensions.global_settings import get_global_settings
+            sampler_config = get_global_settings().get_sampler_config(
+                request_temp=request.temperature,
+                request_top_p=request.top_p,
+                request_top_k=request.top_k
+            )
+        except ImportError:
+            # Fallback if global_settings not available
+            # Conservative defaults for reasoning (low hallucination)
+            sampler_config = {
+                "temp": request.temperature if request.temperature is not None else 0.3,
+                "top_p": request.top_p if request.top_p is not None else 0.85,
+                "top_k": request.top_k if request.top_k is not None else 30,
+            }
 
         logger.debug(f"Anthropic messages count: {len(messages)}")
         logger.debug(f"Anthropic tools count: {len(tools) if tools else 0}")
+        logger.debug(f"Sampler config: temp={sampler_config['temp']}, top_p={sampler_config['top_p']}, top_k={sampler_config['top_k']}")
         if tools:
             logger.debug(f"First tool: {tools[0].get('function', {}).get('name', tools[0].get('name', 'unknown'))}")
 
