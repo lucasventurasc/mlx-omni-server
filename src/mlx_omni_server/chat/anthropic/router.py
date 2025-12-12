@@ -6,6 +6,8 @@ import threading
 from typing import Any, Generator, Optional, AsyncGenerator
 from pathlib import Path
 
+from mlx_omni_server.chat.gpu_lock import mlx_generation_lock
+
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
@@ -146,8 +148,11 @@ async def create_message(raw_request: Request):
     if not request.stream:
         flog.debug(f"Non-streaming request: model={request.model}, max_tokens={request.max_tokens}")
         try:
-            # Run synchronous generate in thread pool to avoid blocking event loop
-            completion = await asyncio.to_thread(anthropic_model.generate, request)
+            # Run synchronous generate in thread pool with lock to prevent concurrent GPU access
+            def generate_with_lock():
+                with mlx_generation_lock:
+                    return anthropic_model.generate(request)
+            completion = await asyncio.to_thread(generate_with_lock)
             flog.debug(f"Non-streaming success: {completion.stop_reason}")
             return JSONResponse(content=completion.model_dump(exclude_none=True))
         except Exception as e:
@@ -177,12 +182,14 @@ async def create_message(raw_request: Request):
 
         def sync_generator():
             nonlocal event_count
-            try:
-                for event in anthropic_model.generate_stream(request):
-                    event_queue.put(event)
-                    event_count += 1
-            finally:
-                event_queue.put(done_sentinel)
+            # Use lock to prevent concurrent GPU access - Metal crashes otherwise
+            with mlx_generation_lock:
+                try:
+                    for event in anthropic_model.generate_stream(request):
+                        event_queue.put(event)
+                        event_count += 1
+                finally:
+                    event_queue.put(done_sentinel)
 
         # Start sync generator in background thread
         thread = threading.Thread(target=sync_generator, daemon=True)

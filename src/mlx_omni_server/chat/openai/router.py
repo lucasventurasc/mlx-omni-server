@@ -13,12 +13,9 @@ from mlx_omni_server.chat.openai.schema import (
     ChatCompletionRequest,
     ChatCompletionResponse,
 )
+from mlx_omni_server.chat.gpu_lock import mlx_generation_lock
 
 router = APIRouter(tags=["chat—completions"])
-
-# Global lock for MLX GPU operations - prevents Metal command buffer conflicts
-# when multiple requests try to load/run models simultaneously
-_mlx_generation_lock = threading.Lock()
 
 
 class ModelNotLoadedError(Exception):
@@ -33,7 +30,7 @@ async def create_chat_completion(request: ChatCompletionRequest):
 
     # Try to get model - will raise error if not loaded
     try:
-        with _mlx_generation_lock:
+        with mlx_generation_lock:
             text_model = _create_text_model(
                 request.model,
                 request.get_extra_params().get("adapter_path"),
@@ -55,7 +52,7 @@ async def create_chat_completion(request: ChatCompletionRequest):
         # Run synchronous generate in thread pool to avoid blocking
         # Lock ensures only one generation runs at a time on GPU
         def generate_with_lock():
-            with _mlx_generation_lock:
+            with mlx_generation_lock:
                 return text_model.generate(request)
         completion = await asyncio.to_thread(generate_with_lock)
         return JSONResponse(content=completion.model_dump(exclude_none=True))
@@ -67,7 +64,7 @@ async def create_chat_completion(request: ChatCompletionRequest):
 
         def sync_generator():
             # Hold lock during entire generation to prevent concurrent GPU access
-            with _mlx_generation_lock:
+            with mlx_generation_lock:
                 try:
                     for chunk in text_model.generate_stream(request):
                         chunk_queue.put(chunk)
