@@ -106,6 +106,37 @@ class Qwen3MoeToolParser(BaseToolParser):
             param_value = match.group(2).strip()
 
             if param_name:
-                parameters[param_name] = param_value
+                # Try to convert to appropriate type
+                parameters[param_name] = self._convert_value(param_value)
 
         return parameters
+
+    def _convert_value(self, value: str):
+        """Convert string value to appropriate Python type.
+
+        Args:
+            value: String value from XML
+
+        Returns:
+            Converted value (int, float, bool, or original string)
+        """
+        # Handle boolean
+        if value.lower() == 'true':
+            return True
+        if value.lower() == 'false':
+            return False
+
+        # Handle integers
+        try:
+            return int(value)
+        except ValueError:
+            pass
+
+        # Handle floats
+        try:
+            return float(value)
+        except ValueError:
+            pass
+
+        # Return as string
+        return value
