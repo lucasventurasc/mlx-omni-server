@@ -104,6 +104,31 @@ models_service = AnthropicModelsService()
 # Legacy caching variables removed - now using shared wrapper_cache
 # This eliminates duplicate caching logic and enables sharing between endpoints
 
+# =============================================================================
+# Post-Generation Hook (for pre-warm, analytics, etc.)
+# =============================================================================
+# External code can set this callback to be notified after each generation
+# Signature: callback(resolved_model: str, messages: list) -> None
+_post_generation_hook = None
+
+def set_post_generation_hook(callback):
+    """Set a callback to be called after each generation.
+
+    The callback receives (resolved_model_path, original_messages).
+    This is useful for triggering cache pre-warming for other models.
+    """
+    global _post_generation_hook
+    _post_generation_hook = callback
+    logger.info(f"Post-generation hook set: {callback}")
+
+def _trigger_post_generation_hook(resolved_model: str, messages: list):
+    """Trigger the post-generation hook if set."""
+    if _post_generation_hook:
+        try:
+            _post_generation_hook(resolved_model, messages)
+        except Exception as e:
+            logger.debug(f"Post-generation hook error: {e}")
+
 
 @router.get("/models", response_model=AnthropicModelList)
 @router.get("/v1/models", response_model=AnthropicModelList)
@@ -220,6 +245,20 @@ async def create_message(raw_request: Request):
                     return anthropic_model.generate(request)
             completion = await asyncio.to_thread(generate_with_lock)
             flog.debug(f"Non-streaming success: {completion.stop_reason}")
+
+            # Trigger post-generation hook for cross-model cache pre-warming
+            try:
+                from patches import resolve_alias_with_backend
+                resolved_model, _ = resolve_alias_with_backend(request.model)
+                messages_dict = []
+                if request.system:
+                    messages_dict.append({"role": "system", "content": str(request.system)})
+                for msg in request.messages:
+                    messages_dict.append({"role": msg.role, "content": str(msg.content) if msg.content else ""})
+                _trigger_post_generation_hook(resolved_model, messages_dict)
+            except Exception as e:
+                logger.debug(f"Post-generation hook trigger failed: {e}")
+
             return JSONResponse(content=completion.model_dump(exclude_none=True))
         except Exception as e:
             flog.error(f"Non-streaming generation failed: {e}")
@@ -357,6 +396,20 @@ async def create_message(raw_request: Request):
         logger.info(f"SSE stream finished with {local_count} events")
         thread.join(timeout=1.0)
 
+        # Trigger post-generation hook for cross-model cache pre-warming
+        try:
+            from patches import resolve_alias_with_backend
+            resolved_model, _ = resolve_alias_with_backend(request.model)
+            # Convert request messages to dict format for the hook
+            messages_dict = []
+            if request.system:
+                messages_dict.append({"role": "system", "content": str(request.system)})
+            for msg in request.messages:
+                messages_dict.append({"role": msg.role, "content": str(msg.content) if msg.content else ""})
+            _trigger_post_generation_hook(resolved_model, messages_dict)
+        except Exception as e:
+            logger.debug(f"Post-generation hook trigger failed: {e}")
+
     return StreamingResponse(
         async_anthropic_event_generator(),
         media_type="text/event-stream",
@@ -377,12 +430,15 @@ def _create_anthropic_model(
     adapter_path: Optional[str] = None,
     draft_model: Optional[str] = None,
     require_loaded: bool = True,
-) -> AnthropicMessagesAdapter:
+):
     """Create an Anthropic Messages adapter based on the model parameters.
 
     Uses the shared wrapper cache to get or create ChatGenerator instance.
     This avoids expensive model reloading when the same model configuration
     is used across different requests or API endpoints.
+
+    Supports both MLX and GGUF backends - automatically dispatches based on
+    model configuration or file extension.
 
     Args:
         model_id: Model name/path
@@ -390,25 +446,80 @@ def _create_anthropic_model(
         draft_model: Optional draft model for speculative decoding
         require_loaded: If True (default), raise error if model not already loaded.
                        This prevents concurrent model loading which crashes Metal.
+
+    Returns:
+        AnthropicMessagesAdapter for MLX backend or GGUFAnthropicAdapter for GGUF backend
     """
+    backend = "mlx"  # Default backend
+
     # IMPORTANT: Resolve alias FIRST before checking if loaded
     # This allows aliases like "claude-haiku-*" to map to loaded models
     try:
-        from patches import resolve_alias, get_draft_model_for, reload_aliases
+        from patches import resolve_alias_with_backend, get_draft_model_for, reload_aliases
         # Reload aliases to pick up any changes made via API
         reload_aliases()
         original_model_id = model_id
-        model_id = resolve_alias(model_id)
+        model_id, backend = resolve_alias_with_backend(model_id)
         if model_id != original_model_id:
-            logger.info(f"Resolved alias '{original_model_id}' -> '{model_id}'")
-        # Also get draft model from config if not provided
-        if draft_model is None:
+            logger.info(f"Resolved alias '{original_model_id}' -> '{model_id}' (backend={backend})")
+        # Also get draft model from config if not provided (only for MLX)
+        if backend == "mlx" and draft_model is None:
             draft_model = get_draft_model_for(original_model_id)
             if draft_model:
+                from patches import resolve_alias
                 draft_model = resolve_alias(draft_model)
     except ImportError:
         pass  # patches module not available
 
+    # =========================================================================
+    # GGUF Backend (via llama-server)
+    # =========================================================================
+    if backend == "gguf":
+        try:
+            from extensions.gguf_backend import gguf_server, GGUFBackend, load_gguf_config
+            from extensions.gguf_adapter import GGUFAnthropicAdapter
+            from extensions.model_configs import get_model_config
+
+            config = load_gguf_config()
+
+            # Get per-model context_length
+            model_config = get_model_config(model_id)
+            tier_context_length = model_config.get("context_length")
+
+            # Auto-start llama-server if needed
+            if config.get("auto_start", True):
+                needs_restart = (
+                    not gguf_server.is_running() or
+                    gguf_server.current_model != model_id or
+                    (tier_context_length and gguf_server.current_context_length != tier_context_length)
+                )
+                if needs_restart:
+                    logger.info(f"Auto-starting llama-server with model: {model_id} (ctx={tier_context_length})")
+                    try:
+                        gguf_server.start(model_id, context_length=tier_context_length)
+                    except Exception as e:
+                        raise ModelNotLoadedError(
+                            f"Failed to start llama-server for GGUF model '{model_id}': {e}"
+                        )
+            elif not gguf_server.is_running():
+                raise ModelNotLoadedError(
+                    f"GGUF model '{model_id}' requires llama-server to be running. "
+                    f"Start it via POST /api/gguf/start?model_path={model_id}"
+                )
+
+            # Create GGUF backend and adapter
+            gguf_backend = GGUFBackend(gguf_server.server_url)
+            return GGUFAnthropicAdapter(gguf_backend)
+
+        except ImportError as e:
+            logger.error(f"GGUF backend not available: {e}")
+            raise ModelNotLoadedError(
+                f"GGUF backend not available. Install dependencies or use MLX model."
+            )
+
+    # =========================================================================
+    # MLX Backend (default)
+    # =========================================================================
     if require_loaded:
         # Only get if already loaded - prevents concurrent GPU access crashes
         wrapper = ChatGenerator.get_if_loaded(

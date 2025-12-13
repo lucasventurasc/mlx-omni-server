@@ -106,12 +106,15 @@ def _create_text_model(
     adapter_path: Optional[str] = None,
     draft_model: Optional[str] = None,
     require_loaded: bool = True,
-) -> OpenAIAdapter:
+):
     """Create a text model based on the model parameters.
 
     Uses the shared wrapper cache to get or create ChatGenerator instance.
     This avoids expensive model reloading when the same model configuration
     is used across different requests or API endpoints.
+
+    Supports both MLX and GGUF backends - automatically dispatches based on
+    model configuration or file extension.
 
     Args:
         model_id: Model name/path
@@ -119,27 +122,85 @@ def _create_text_model(
         draft_model: Optional draft model for speculative decoding
         require_loaded: If True (default), raise error if model not already loaded.
                        This prevents concurrent model loading which crashes Metal.
+
+    Returns:
+        OpenAIAdapter for MLX backend or GGUFOpenAIAdapter for GGUF backend
     """
+    import logging
+    logger = logging.getLogger(__name__)
+    backend = "mlx"  # Default backend
+
     # IMPORTANT: Resolve alias FIRST before checking if loaded
     # This allows aliases like "claude-haiku-*" to map to loaded models
     try:
-        import logging
-        logger = logging.getLogger(__name__)
-        from patches import resolve_alias, get_draft_model_for, reload_aliases
+        from patches import resolve_alias_with_backend, get_draft_model_for, reload_aliases
         # Reload aliases to pick up any changes made via API
         reload_aliases()
         original_model_id = model_id
-        model_id = resolve_alias(model_id)
+        model_id, backend = resolve_alias_with_backend(model_id)
         if model_id != original_model_id:
-            logger.info(f"Resolved alias '{original_model_id}' -> '{model_id}'")
-        # Also get draft model from config if not provided
-        if draft_model is None:
+            logger.info(f"Resolved alias '{original_model_id}' -> '{model_id}' (backend={backend})")
+        # Also get draft model from config if not provided (only for MLX)
+        if backend == "mlx" and draft_model is None:
             draft_model = get_draft_model_for(original_model_id)
             if draft_model:
+                from patches import resolve_alias
                 draft_model = resolve_alias(draft_model)
     except ImportError:
         pass  # patches module not available
 
+    # Resolve to local path if available (MLX Studio local model lookup)
+    # This ensures the cache key matches what was used in /api/models/load
+    try:
+        from extensions.models import ModelManager
+        _model_manager = ModelManager()
+        local_models = _model_manager.list_local_models()
+        local_model = next((m for m in local_models if m.id == model_id), None)
+        if local_model and local_model.path:
+            logger.info(f"Resolved to local path: {model_id} -> {local_model.path}")
+            model_id = local_model.path
+    except ImportError:
+        pass  # extensions not available
+
+    # =========================================================================
+    # GGUF Backend (via llama-server)
+    # =========================================================================
+    if backend == "gguf":
+        try:
+            from extensions.gguf_backend import gguf_server, GGUFBackend, load_gguf_config
+            from extensions.gguf_openai_adapter import GGUFOpenAIAdapter
+
+            config = load_gguf_config()
+
+            # Auto-start llama-server if needed
+            if config.get("auto_start", True):
+                if not gguf_server.is_running() or gguf_server.current_model != model_id:
+                    logger.info(f"Auto-starting llama-server with model: {model_id}")
+                    try:
+                        gguf_server.start(model_id)
+                    except Exception as e:
+                        raise ModelNotLoadedError(
+                            f"Failed to start llama-server for GGUF model '{model_id}': {e}"
+                        )
+            elif not gguf_server.is_running():
+                raise ModelNotLoadedError(
+                    f"GGUF model '{model_id}' requires llama-server to be running. "
+                    f"Start it via POST /api/gguf/start?model_path={model_id}"
+                )
+
+            # Create GGUF backend and adapter
+            gguf_backend = GGUFBackend(gguf_server.server_url)
+            return GGUFOpenAIAdapter(gguf_backend)
+
+        except ImportError as e:
+            logger.error(f"GGUF backend not available: {e}")
+            raise ModelNotLoadedError(
+                f"GGUF backend not available. Install dependencies or use MLX model."
+            )
+
+    # =========================================================================
+    # MLX Backend (default)
+    # =========================================================================
     if require_loaded:
         # Only get if already loaded - prevents concurrent GPU access crashes
         wrapper = ChatGenerator.get_if_loaded(

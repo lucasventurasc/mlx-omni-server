@@ -215,6 +215,27 @@ IMPORTANT TOOL USE GUIDELINES:
         # Convert tools
         tools = self._convert_tools_to_mlx(request.tools)
 
+        # Check context usage and store warning for later
+        self._context_warning = None
+        try:
+            from extensions.auto_compact import check_context_warning
+            from extensions.model_configs import get_model_config
+
+            # Get context limit from per-model config
+            model_config = get_model_config(request.model)
+            ctx_size = model_config.get("context_length", 65536)
+
+            warning_config = {
+                "context_limit": ctx_size,
+                "threshold_percent": 75,
+            }
+
+            self._context_warning = check_context_warning(
+                messages, tools, request.max_tokens, warning_config
+            )
+        except Exception as e:
+            logger.warning(f"[MLX] Context warning check failed: {e}")
+
         # Template parameters
         template_kwargs = {}
 
@@ -261,6 +282,7 @@ IMPORTANT TOOL USE GUIDELINES:
             "sampler": sampler_config,
             "template_kwargs": template_kwargs,
             "enable_prompt_cache": True,
+            "repetition_penalty": 1.05,  # Prevent repetition loops
         }
 
         # Note: ChatGenerator doesn't currently support stop_sequences
@@ -428,12 +450,31 @@ IMPORTANT TOOL USE GUIDELINES:
             final_result = None
             current_block_index = 0
             in_thinking = False
+
+            # Emit context warning if needed (before model response)
+            if hasattr(self, '_context_warning') and self._context_warning and self._context_warning.should_warn:
+                yield MessageStreamEvent(
+                    type=StreamEventType.CONTENT_BLOCK_START,
+                    index=current_block_index,
+                    content_block=TextBlock(text=""),
+                )
+                yield MessageStreamEvent(
+                    type=StreamEventType.CONTENT_BLOCK_DELTA,
+                    index=current_block_index,
+                    delta=StreamDelta(type="text_delta", text=self._context_warning.warning_message + "\n\n"),
+                )
+                yield MessageStreamEvent(
+                    type=StreamEventType.CONTENT_BLOCK_STOP,
+                    index=current_block_index,
+                )
+                current_block_index += 1
             chunk_count = 0
 
             logger.info(f"Starting stream generation...")
             for chunk in self._generate_wrapper.generate_stream(**params):
                 chunk_count += 1
-                if chunk_count <= 3 or chunk_count % 50 == 0:
+                # Only log first few and every 500th chunk to reduce overhead
+                if chunk_count <= 3 or chunk_count % 500 == 0:
                     logger.debug(f"Stream chunk {chunk_count}: text_delta='{chunk.content.text_delta[:50] if chunk.content.text_delta else None}'")
                 # Determine content type and send appropriate events
                 if chunk.content.reasoning_delta:

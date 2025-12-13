@@ -120,7 +120,7 @@ class OpenAIAdapter:
             "top_logprobs": request.top_logprobs if request.logprobs else None,
             "template_kwargs": template_kwargs,
             "enable_prompt_cache": True,
-            "repetition_penalty": request.presence_penalty,
+            "repetition_penalty": request.presence_penalty if request.presence_penalty else 1.05,
             "json_schema": json_schema,
         }
 
@@ -277,10 +277,14 @@ class OpenAIAdapter:
 
                         # Check if safe_content has '<' that could be start of tool marker
                         # Move everything from last '<' onward back to buffer
+                        # But don't buffer <think> or </think> tags - let them through for reasoning display
                         last_angle = safe_content.rfind('<')
                         if last_angle >= 0:
-                            buffer = safe_content[last_angle:] + buffer
-                            safe_content = safe_content[:last_angle]
+                            potential_tag = safe_content[last_angle:]
+                            # Allow thinking tags to pass through immediately
+                            if not (potential_tag.startswith('<think') or potential_tag.startswith('</think')):
+                                buffer = safe_content[last_angle:] + buffer
+                                safe_content = safe_content[:last_angle]
 
                         if safe_content:
                             message = ChatMessage(role=Role.ASSISTANT, content=safe_content)
@@ -302,10 +306,13 @@ class OpenAIAdapter:
 
             # Flush remaining buffer if no tool call was detected
             # But don't flush if buffer looks like start of tool call (starts with '<')
+            # Always flush thinking tags though
             if buffer and not in_tool_call:
-                # Check if buffer might be incomplete tool call
-                is_potential_tool_call = buffer.strip().startswith('<') and any(
-                    buffer.strip().startswith(m[:len(buffer.strip())])
+                # Check if buffer might be incomplete tool call (but not thinking tags)
+                stripped_buffer = buffer.strip()
+                is_thinking_tag = stripped_buffer.startswith('<think') or stripped_buffer.startswith('</think')
+                is_potential_tool_call = not is_thinking_tag and stripped_buffer.startswith('<') and any(
+                    stripped_buffer.startswith(m[:len(stripped_buffer)])
                     for m in TOOL_MARKERS
                 )
                 if not is_potential_tool_call:
