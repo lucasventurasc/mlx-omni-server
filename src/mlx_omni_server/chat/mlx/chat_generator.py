@@ -254,6 +254,7 @@ class ChatGenerator:
         # Core MLX parameters
         mlx_kwargs = {
             "max_tokens": max_tokens,
+            "prefill_step_size": 4096,  # Larger step size for faster prefill on M2 Ultra
         }
 
         # Handle sampler parameter
