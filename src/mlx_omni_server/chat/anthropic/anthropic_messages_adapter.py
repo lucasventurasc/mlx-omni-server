@@ -479,7 +479,34 @@ IMPORTANT TOOL USE GUIDELINES:
                             content_block=TextBlock(text=""),
                         )
 
-                    # Text delta
+                    # Check if this delta contains tool call XML that should be hidden
+                    # Tool calls use <function=name> or <tool_call> format
+                    text_to_send = chunk.content.text_delta
+
+                    # If we detect start of tool call XML, don't stream it
+                    # Instead, accumulate it silently for parsing at end
+                    if '<function=' in accumulated_text or '<tool_call>' in accumulated_text:
+                        # Already in tool call mode - don't stream anything
+                        accumulated_text += chunk.content.text_delta
+                        continue
+                    elif '<function=' in text_to_send or '<tool_call>' in text_to_send:
+                        # Starting tool call - send text before the marker, hide the rest
+                        marker = '<function=' if '<function=' in text_to_send else '<tool_call>'
+                        marker_pos = text_to_send.find(marker)
+                        text_before = text_to_send[:marker_pos]
+
+                        if text_before.strip():
+                            yield MessageStreamEvent(
+                                type=StreamEventType.CONTENT_BLOCK_DELTA,
+                                index=current_block_index,
+                                delta=StreamDelta(
+                                    type="text_delta", text=text_before
+                                ),
+                            )
+                        accumulated_text += chunk.content.text_delta
+                        continue
+
+                    # Normal text delta - stream it
                     yield MessageStreamEvent(
                         type=StreamEventType.CONTENT_BLOCK_DELTA,
                         index=current_block_index,

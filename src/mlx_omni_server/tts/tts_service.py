@@ -1,9 +1,5 @@
-import os
 from pathlib import Path
-from typing import Optional
 
-from f5_tts_mlx.generate import generate
-from mlx_audio.tts.generate import generate_audio
 from mlx_audio.tts.utils import load_model, get_model_path
 from pydantic import BaseModel, Field
 from typing_extensions import override
@@ -53,26 +49,8 @@ class TTSModelAdapter(BaseModel):
 
     @classmethod
     def from_path_or_hf_repo(cls, path_or_hf_repo: str = None) -> "TTSModelAdapter":
-        if path_or_hf_repo == "lucasnewman/f5-tts-mlx":
-            return F5Model(path_or_hf_repo=path_or_hf_repo)
-        else:
-            # Default to Kokoro if no model specified
-            return MlxAudioModel(path_or_hf_repo=path_or_hf_repo or "mlx-community/Kokoro-82M-4bit")
-
-
-class F5Model(TTSModelAdapter):
-
-    @override
-    def generate_audio(self, request: TTSRequest, output_path: str | Path) -> bool:
-        self.path_or_hf_repo = request.model
-        generate(
-            model_name=request.model,
-            generation_text=request.input,
-            speed=request.speed,
-            output_path=str(output_path),
-            **(request.get_extra_params() or {}),
-        )
-        return Path(output_path).exists()
+        # Default to Kokoro if no model specified
+        return MlxAudioModel(path_or_hf_repo=path_or_hf_repo or "mlx-community/Kokoro-82M-4bit")
 
 
 class MlxAudioModel(TTSModelAdapter):
@@ -85,9 +63,8 @@ class MlxAudioModel(TTSModelAdapter):
 
         # Determine lang_code based on model type
         is_marvis = "marvis" in self.path_or_hf_repo.lower() or "sesame" in self.path_or_hf_repo.lower()
-        is_dia = "dia" in self.path_or_hf_repo.lower()
 
-        if is_marvis or is_dia:
+        if is_marvis:
             lang_code = None
         else:
             # Kokoro uses voice prefix as lang_code
