@@ -3,6 +3,9 @@ import logging
 import asyncio
 import queue
 import threading
+import hashlib
+import time
+from collections import deque
 from typing import Any, Generator, Optional, AsyncGenerator
 from pathlib import Path
 
@@ -22,6 +25,33 @@ from .models_service import AnthropicModelsService
 from .schema import AnthropicModelList
 
 logger = logging.getLogger(__name__)
+
+# =============================================================================
+# Duplicate Response Detection
+# =============================================================================
+# Track recent response hashes to detect when model is stuck in a loop
+_response_history: deque = deque(maxlen=10)
+_response_history_lock = threading.Lock()
+
+def _hash_response(text: str) -> str:
+    """Create a short hash of response text for comparison."""
+    return hashlib.md5(text.encode()).hexdigest()[:16]
+
+def _check_duplicate_response(response_text: str) -> int:
+    """Check if this response is a duplicate.
+
+    Returns the number of times this exact response has been seen recently.
+    """
+    response_hash = _hash_response(response_text)
+    with _response_history_lock:
+        count = sum(1 for h in _response_history if h == response_hash)
+        _response_history.append(response_hash)
+        return count
+
+def _clear_response_history():
+    """Clear the response history (e.g., on successful unique response)."""
+    with _response_history_lock:
+        _response_history.clear()
 
 # File logger for debugging Claude Code requests
 _file_logger = None
@@ -174,20 +204,41 @@ async def create_message(raw_request: Request):
 
     flog.debug(f"Starting streaming request")
 
+    # Check for duplicate requests based on message fingerprint
+    # This helps detect when the model is stuck generating the same response
+    msg_fingerprint = ""
+    if request.messages:
+        last_msg = request.messages[-1]
+        if hasattr(last_msg, 'content'):
+            content = str(last_msg.content)[:500] if last_msg.content else ""
+            msg_fingerprint = content
+
+    duplicate_count = _check_duplicate_response(msg_fingerprint)
+    temp_boost = 0.0
+    if duplicate_count > 0:
+        # Increase temperature progressively for repeated requests
+        temp_boost = min(0.5, duplicate_count * 0.15)
+        logger.warning(f"Detected duplicate request (count={duplicate_count}), applying temp_boost={temp_boost}")
+
     # For streaming, use a queue to pass events from sync generator to async
     async def async_anthropic_event_generator() -> AsyncGenerator[str, None]:
         event_queue = queue.Queue()
         done_sentinel = object()
         event_count = 0
+        accumulated_text_tracker = []  # Track response text for duplicate detection
 
         def sync_generator():
             nonlocal event_count
             # Use lock to prevent concurrent GPU access - Metal crashes otherwise
             with mlx_generation_lock:
                 try:
-                    for event in anthropic_model.generate_stream(request):
+                    for event in anthropic_model.generate_stream(request, temp_boost=temp_boost):
                         event_queue.put(event)
                         event_count += 1
+                        # Track text deltas for duplicate detection
+                        if hasattr(event, 'delta') and event.delta:
+                            if hasattr(event.delta, 'text') and event.delta.text:
+                                accumulated_text_tracker.append(event.delta.text)
                 finally:
                     event_queue.put(done_sentinel)
 
@@ -229,6 +280,13 @@ async def create_message(raw_request: Request):
                 # No event yet, yield control to event loop
                 await asyncio.sleep(0)
                 continue
+
+        # Check if this response is a duplicate and log
+        response_text = ''.join(accumulated_text_tracker)
+        if response_text:
+            dup_count = _check_duplicate_response(response_text)
+            if dup_count > 1:
+                logger.warning(f"Generated duplicate response (seen {dup_count} times): '{response_text[:100]}...'")
 
         logger.info(f"SSE stream finished with {local_count} events")
         thread.join(timeout=1.0)

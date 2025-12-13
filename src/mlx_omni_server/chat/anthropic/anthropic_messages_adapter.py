@@ -195,11 +195,12 @@ IMPORTANT TOOL USE GUIDELINES:
 
         return mlx_tools
 
-    def _prepare_generation_params(self, request: MessagesRequest) -> Dict[str, Any]:
+    def _prepare_generation_params(self, request: MessagesRequest, temp_boost: float = 0.0) -> Dict[str, Any]:
         """Prepare parameters for MLX generation.
 
         Args:
             request: Anthropic Messages API request
+            temp_boost: Additional temperature to add (for breaking out of loops)
 
         Returns:
             Parameters for ChatGenerator
@@ -236,6 +237,12 @@ IMPORTANT TOOL USE GUIDELINES:
                 "top_p": request.top_p if request.top_p is not None else 0.85,
                 "top_k": request.top_k if request.top_k is not None else 30,
             }
+
+        # Apply temperature boost if provided (to break out of repetition loops)
+        if temp_boost > 0:
+            original_temp = sampler_config['temp']
+            sampler_config['temp'] = min(1.0, sampler_config['temp'] + temp_boost)
+            logger.info(f"Applied temp boost: {original_temp} -> {sampler_config['temp']} (boost={temp_boost})")
 
         logger.debug(f"Anthropic messages count: {len(messages)}")
         logger.debug(f"Anthropic tools count: {len(tools) if tools else 0}")
@@ -382,12 +389,13 @@ IMPORTANT TOOL USE GUIDELINES:
             raise RuntimeError(f"Failed to generate completion: {str(e)}")
 
     def generate_stream(
-        self, request: MessagesRequest
+        self, request: MessagesRequest, temp_boost: float = 0.0
     ) -> Generator[MessageStreamEvent, None, None]:
         """Generate streaming response.
 
         Args:
             request: Anthropic Messages API request
+            temp_boost: Additional temperature to add (for breaking out of loops)
 
         Yields:
             Anthropic streaming events
@@ -395,8 +403,8 @@ IMPORTANT TOOL USE GUIDELINES:
         try:
             message_id = f"msg_{uuid.uuid4().hex[:24]}"
 
-            # Prepare parameters
-            params = self._prepare_generation_params(request)
+            # Prepare parameters with optional temperature boost
+            params = self._prepare_generation_params(request, temp_boost=temp_boost)
 
             # Start message event
             yield MessageStreamEvent(
@@ -508,6 +516,17 @@ IMPORTANT TOOL USE GUIDELINES:
                     accumulated_text
                 )
                 tool_calls = chat_result.tool_calls
+
+                # Filter out tool calls with empty or missing required inputs
+                # This prevents loops where the model generates tool calls without parameters
+                if tool_calls:
+                    valid_tool_calls = []
+                    for tc in tool_calls:
+                        if tc.arguments and len(tc.arguments) > 0:
+                            valid_tool_calls.append(tc)
+                        else:
+                            logger.warning(f"Filtered out tool call '{tc.name}' with empty arguments")
+                    tool_calls = valid_tool_calls if valid_tool_calls else None
 
                 # If we found tool calls, emit ToolUseBlock events for each
                 if tool_calls:
