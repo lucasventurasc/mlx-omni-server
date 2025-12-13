@@ -27,6 +27,39 @@ from .schema import AnthropicModelList
 logger = logging.getLogger(__name__)
 
 # =============================================================================
+# Plan Mode Tracking (per user session)
+# =============================================================================
+# Track which user sessions have entered plan mode
+# Key: user_id from metadata, Value: True if plan mode is active
+_plan_mode_sessions: dict = {}
+_plan_mode_lock = threading.Lock()
+
+def get_user_id(request) -> Optional[str]:
+    """Extract user_id from request metadata."""
+    if request.metadata and hasattr(request.metadata, 'user_id'):
+        return request.metadata.user_id
+    return None
+
+def is_plan_mode_active(user_id: Optional[str]) -> bool:
+    """Check if plan mode is active for a user."""
+    if not user_id:
+        return False
+    with _plan_mode_lock:
+        return _plan_mode_sessions.get(user_id, False)
+
+def set_plan_mode(user_id: Optional[str], active: bool):
+    """Set plan mode state for a user."""
+    if not user_id:
+        return
+    with _plan_mode_lock:
+        if active:
+            _plan_mode_sessions[user_id] = True
+            logger.info(f"Plan mode ACTIVATED for user {user_id[:20]}...")
+        else:
+            _plan_mode_sessions.pop(user_id, None)
+            logger.info(f"Plan mode DEACTIVATED for user {user_id[:20]}...")
+
+# =============================================================================
 # Duplicate Response Detection
 # =============================================================================
 # Track recent response hashes to detect when model is stuck in a loop
@@ -135,6 +168,9 @@ async def create_message(raw_request: Request):
         flog.debug(f"stream: {body.get('stream')}, model: {body.get('model')}, max_tokens: {body.get('max_tokens')}")
         flog.debug(f"messages count: {len(body.get('messages', []))}")
         flog.debug(f"tools count: {len(body.get('tools', []))}")
+        # Log metadata and any potential session identifiers
+        flog.debug(f"metadata: {body.get('metadata')}")
+        flog.debug(f"extra keys: {[k for k in body.keys() if k not in ['model', 'messages', 'max_tokens', 'stream', 'tools', 'system', 'temperature', 'top_p', 'top_k', 'stop_sequences', 'tool_choice', 'thinking']]}")
         # Log first message content (truncated)
         if body.get('messages'):
             first_msg = body['messages'][0]
@@ -220,12 +256,16 @@ async def create_message(raw_request: Request):
         temp_boost = min(0.5, duplicate_count * 0.15)
         logger.warning(f"Detected duplicate request (count={duplicate_count}), applying temp_boost={temp_boost}")
 
+    # Get user_id for plan mode tracking
+    user_id = get_user_id(request)
+
     # For streaming, use a queue to pass events from sync generator to async
     async def async_anthropic_event_generator() -> AsyncGenerator[str, None]:
         event_queue = queue.Queue()
         done_sentinel = object()
         event_count = 0
         accumulated_text_tracker = []  # Track response text for duplicate detection
+        filtered_block_indices = set()  # Track which content block indices to filter
 
         def sync_generator():
             nonlocal event_count
@@ -256,6 +296,32 @@ async def create_message(raw_request: Request):
                     break
 
                 local_count += 1
+
+                # Filter plan mode tool calls based on session state
+                event_index = getattr(event, 'index', None)
+
+                if event.type.value == "content_block_start" and event.content_block:
+                    tool_name = getattr(event.content_block, 'name', None)
+                    if tool_name == 'EnterPlanMode':
+                        # Track that plan mode was entered for this user
+                        set_plan_mode(user_id, True)
+                    elif tool_name == 'ExitPlanMode':
+                        # Only allow ExitPlanMode if plan mode is active
+                        if not is_plan_mode_active(user_id):
+                            logger.warning(f"Filtered ExitPlanMode - plan mode not active for user {user_id[:20] if user_id else 'unknown'}...")
+                            # Mark this block index to be filtered
+                            if event_index is not None:
+                                filtered_block_indices.add(event_index)
+                            continue
+                        else:
+                            # Plan mode is being exited
+                            set_plan_mode(user_id, False)
+
+                # Skip events for filtered blocks (delta and stop events)
+                if event_index is not None and event_index in filtered_block_indices:
+                    if event.type.value in ["content_block_delta", "content_block_stop"]:
+                        continue
+
                 # Use mode='json' to properly serialize enums to their string values
                 event_data = event.model_dump(mode='json', exclude_none=True)
 

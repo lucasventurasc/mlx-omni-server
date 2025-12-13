@@ -163,6 +163,10 @@ IMPORTANT TOOL USE GUIDELINES:
 
         return mlx_messages
 
+    # Tools that require state tracking - see PlanModeTracker
+    # ExitPlanMode can only be called if EnterPlanMode was called first
+    PLAN_MODE_TOOLS = {'ExitPlanMode', 'EnterPlanMode'}
+
     def _convert_tools_to_mlx(
         self, tools: Optional[List[AnthropicTool]]
     ) -> Optional[List[Dict[str, Any]]]:
