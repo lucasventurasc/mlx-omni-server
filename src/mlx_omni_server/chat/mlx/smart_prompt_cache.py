@@ -11,6 +11,7 @@ Key improvements over the original PromptCache:
 2. Multiple cache slots for different prompt patterns
 3. LRU eviction when memory is constrained
 4. Separate caching for static components (system prompt, tools)
+5. Disk persistence for KV cache (saves ~70s on 21K token prompts)
 
 This is designed for Claude Code workloads where:
 - System prompt + tools are ~15,000 tokens and rarely change
@@ -19,14 +20,19 @@ This is designed for Claude Code workloads where:
 """
 
 import hashlib
+import json
 import os
 import struct
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import mlx.core as mx
 from mlx_lm.models.cache import (
+    KVCache,
+    RotatingKVCache,
     can_trim_prompt_cache,
     make_prompt_cache,
     trim_prompt_cache,
@@ -42,6 +48,13 @@ DEFAULT_BLOCK_SIZE = int(os.getenv("MLX_CACHE_BLOCK_SIZE", "256"))
 DEFAULT_MAX_SLOTS = int(os.getenv("MLX_CACHE_MAX_SLOTS", "4"))
 DEFAULT_MIN_REUSE = int(os.getenv("MLX_CACHE_MIN_REUSE", "512"))
 MAX_CACHED_TOKENS = int(os.getenv("MLX_CACHE_MAX_TOKENS", "65536"))  # 64K max per slot
+
+# Disk cache configuration
+DISK_CACHE_DIR = Path(os.getenv("MLX_DISK_CACHE_DIR", os.path.expanduser("~/.cache/mlx-studio/kv")))
+DISK_CACHE_ENABLED = os.getenv("MLX_DISK_CACHE_ENABLED", "true").lower() == "true"
+DISK_CACHE_MIN_TOKENS = int(os.getenv("MLX_DISK_CACHE_MIN_TOKENS", "4096"))  # Only save large prompts
+DISK_CACHE_MAX_AGE_DAYS = int(os.getenv("MLX_DISK_CACHE_MAX_AGE_DAYS", "7"))  # Auto-delete after N days
+DISK_CACHE_MAX_SIZE_GB = float(os.getenv("MLX_DISK_CACHE_MAX_SIZE_GB", "50"))  # Max total cache size
 
 
 def compute_token_hash(tokens: List[int], prefix_hash: str = "") -> str:
@@ -92,6 +105,366 @@ def compute_block_hashes(tokens: List[int], block_size: int = 256) -> List[str]:
         prefix_hash = block_hash
 
     return hashes
+
+
+def get_disk_cache_path(model_id: str, prompt_hash: str) -> Path:
+    """Get the path for a disk-cached KV cache file."""
+    # Sanitize model_id for filesystem
+    safe_model_id = model_id.replace("/", "_").replace("\\", "_")
+    return DISK_CACHE_DIR / f"{safe_model_id}_{prompt_hash}.safetensors"
+
+
+def save_cache_to_disk(
+    cache: List[Any],
+    tokens: List[int],
+    model_id: str,
+    block_hashes: List[str],
+) -> Optional[Path]:
+    """
+    Save KV cache to disk for later reuse.
+
+    Args:
+        cache: List of KVCache objects (one per layer)
+        tokens: The token sequence this cache represents
+        model_id: Model identifier
+        block_hashes: Pre-computed block hashes
+
+    Returns:
+        Path to saved file, or None if save failed
+    """
+    if not DISK_CACHE_ENABLED:
+        return None
+
+    if len(tokens) < DISK_CACHE_MIN_TOKENS:
+        logger.debug(f"Skipping disk cache: {len(tokens)} tokens < {DISK_CACHE_MIN_TOKENS} min")
+        return None
+
+    # Skip RotatingKVCache - not supported for disk caching
+    if cache and any(isinstance(c, RotatingKVCache) for c in cache):
+        logger.debug("Skipping disk cache: RotatingKVCache not supported")
+        return None
+
+    # Skip non-standard KVCache types (quantized, MoE, etc.)
+    if cache and not all(type(c).__name__ == 'KVCache' for c in cache):
+        cache_types = set(type(c).__name__ for c in cache)
+        logger.debug(f"Skipping disk cache: non-standard cache types {cache_types}")
+        return None
+
+    try:
+        # Use the last block hash as the prompt identifier
+        prompt_hash = block_hashes[-1] if block_hashes else compute_token_hash(tokens)
+        cache_path = get_disk_cache_path(model_id, prompt_hash)
+
+        # Create directory if needed
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Build the data dict for saving
+        save_data = {}
+
+        for i, layer_cache in enumerate(cache):
+            if hasattr(layer_cache, 'state') and layer_cache.keys is not None:
+                keys, values = layer_cache.state
+                save_data[f"layer_{i}_keys"] = keys
+                save_data[f"layer_{i}_values"] = values
+
+        if not save_data:
+            logger.warning("No cache data to save (empty cache)")
+            return None
+
+        # Save using MLX's safetensors format
+        mx.save_safetensors(str(cache_path), save_data)
+
+        # Save metadata separately (tokens, hashes, etc.)
+        meta_path = cache_path.with_suffix(".json")
+        metadata = {
+            "model_id": model_id,
+            "num_tokens": len(tokens),
+            "num_layers": len(cache),
+            "block_hashes": block_hashes,
+            "tokens": tokens,  # Store tokens for validation
+            "created_at": time.time(),
+        }
+        with open(meta_path, "w") as f:
+            json.dump(metadata, f)
+
+        # Get file size for logging
+        file_size_mb = cache_path.stat().st_size / (1024 * 1024)
+        logger.info(
+            f"Saved KV cache to disk: {len(tokens)} tokens, "
+            f"{len(cache)} layers, {file_size_mb:.1f}MB -> {cache_path.name}"
+        )
+
+        # Run cleanup after saving
+        cleanup_disk_cache()
+
+        return cache_path
+
+    except Exception as e:
+        # Log more details for debugging
+        if cache:
+            cache_types = [type(c).__name__ for c in cache[:3]]  # First 3 layers
+            logger.warning(f"Failed to save cache to disk: {e} (cache types: {cache_types})")
+        else:
+            logger.warning(f"Failed to save cache to disk: {e}")
+        return None
+
+
+def load_cache_from_disk(
+    model_id: str,
+    prompt_hash: str,
+    num_layers: int,
+) -> Optional[Tuple[List[Any], List[int], List[str]]]:
+    """
+    Load KV cache from disk.
+
+    Args:
+        model_id: Model identifier
+        prompt_hash: Hash of the prompt to load
+        num_layers: Expected number of layers (must match)
+
+    Returns:
+        Tuple of (cache, tokens, block_hashes) or None if not found/invalid
+    """
+    if not DISK_CACHE_ENABLED:
+        return None
+
+    try:
+        cache_path = get_disk_cache_path(model_id, prompt_hash)
+        meta_path = cache_path.with_suffix(".json")
+
+        if not cache_path.exists() or not meta_path.exists():
+            return None
+
+        # Load metadata first
+        with open(meta_path, "r") as f:
+            metadata = json.load(f)
+
+        # Validate model and layers
+        if metadata["model_id"] != model_id:
+            logger.debug(f"Disk cache model mismatch: {metadata['model_id']} != {model_id}")
+            return None
+
+        if metadata["num_layers"] != num_layers:
+            logger.debug(f"Disk cache layer count mismatch: {metadata['num_layers']} != {num_layers}")
+            return None
+
+        start_time = time.perf_counter()
+
+        # Load the tensors
+        data = mx.load(str(cache_path))
+
+        # Reconstruct cache objects
+        cache = []
+        for i in range(num_layers):
+            keys_key = f"layer_{i}_keys"
+            values_key = f"layer_{i}_values"
+
+            if keys_key not in data or values_key not in data:
+                logger.warning(f"Missing layer {i} in disk cache")
+                return None
+
+            layer_cache = KVCache()
+            layer_cache.state = (data[keys_key], data[values_key])
+            cache.append(layer_cache)
+
+        # Force evaluation to actually load into memory
+        mx.eval([c.keys for c in cache] + [c.values for c in cache])
+
+        elapsed_ms = (time.perf_counter() - start_time) * 1000
+        file_size_mb = cache_path.stat().st_size / (1024 * 1024)
+
+        logger.info(
+            f"Loaded KV cache from disk: {metadata['num_tokens']} tokens, "
+            f"{num_layers} layers, {file_size_mb:.1f}MB in {elapsed_ms:.0f}ms"
+        )
+
+        return cache, metadata["tokens"], metadata["block_hashes"]
+
+    except Exception as e:
+        logger.warning(f"Failed to load cache from disk: {e}")
+        return None
+
+
+def find_disk_cache_by_prefix(
+    model_id: str,
+    prompt_hashes: List[str],
+) -> Optional[Tuple[str, int]]:
+    """
+    Find a disk cache that matches a prefix of the given prompt.
+
+    Args:
+        model_id: Model identifier
+        prompt_hashes: Block hashes for the new prompt
+
+    Returns:
+        Tuple of (matching_hash, matching_blocks) or None if no match
+    """
+    if not DISK_CACHE_ENABLED or not DISK_CACHE_DIR.exists():
+        return None
+
+    safe_model_id = model_id.replace("/", "_").replace("\\", "_")
+
+    best_match_hash = None
+    best_match_blocks = 0
+
+    try:
+        # Look for cache files for this model
+        for meta_file in DISK_CACHE_DIR.glob(f"{safe_model_id}_*.json"):
+            try:
+                with open(meta_file, "r") as f:
+                    metadata = json.load(f)
+
+                cached_hashes = metadata.get("block_hashes", [])
+                if not cached_hashes:
+                    continue
+
+                # Count matching blocks from the start
+                match_blocks = 0
+                for i, (ph, ch) in enumerate(zip(prompt_hashes, cached_hashes)):
+                    if ph == ch:
+                        match_blocks = i + 1
+                    else:
+                        break
+
+                if match_blocks > best_match_blocks:
+                    best_match_blocks = match_blocks
+                    best_match_hash = cached_hashes[-1]  # The cache is indexed by last hash
+
+            except Exception:
+                continue
+
+        if best_match_hash and best_match_blocks > 0:
+            return best_match_hash, best_match_blocks
+
+    except Exception as e:
+        logger.debug(f"Error searching disk cache: {e}")
+
+    return None
+
+
+def clear_disk_cache(model_id: Optional[str] = None) -> int:
+    """
+    Clear disk cache files.
+
+    Args:
+        model_id: If provided, only clear cache for this model. Otherwise clear all.
+
+    Returns:
+        Number of files deleted
+    """
+    if not DISK_CACHE_DIR.exists():
+        return 0
+
+    deleted = 0
+    try:
+        if model_id:
+            safe_model_id = model_id.replace("/", "_").replace("\\", "_")
+            pattern = f"{safe_model_id}_*"
+        else:
+            pattern = "*"
+
+        for cache_file in DISK_CACHE_DIR.glob(pattern):
+            try:
+                cache_file.unlink()
+                deleted += 1
+            except Exception:
+                pass
+
+        logger.info(f"Cleared {deleted} disk cache files")
+
+    except Exception as e:
+        logger.warning(f"Error clearing disk cache: {e}")
+
+    return deleted
+
+
+def cleanup_disk_cache() -> Dict[str, int]:
+    """
+    Clean up old or excess disk cache files.
+
+    Removes:
+    - Cache files older than DISK_CACHE_MAX_AGE_DAYS
+    - Oldest files when total size exceeds DISK_CACHE_MAX_SIZE_GB
+
+    Returns:
+        Dict with cleanup statistics
+    """
+    if not DISK_CACHE_ENABLED or not DISK_CACHE_DIR.exists():
+        return {"deleted_by_age": 0, "deleted_by_size": 0, "total_size_mb": 0}
+
+    deleted_by_age = 0
+    deleted_by_size = 0
+    current_time = time.time()
+    max_age_seconds = DISK_CACHE_MAX_AGE_DAYS * 24 * 60 * 60
+    max_size_bytes = DISK_CACHE_MAX_SIZE_GB * 1024 * 1024 * 1024
+
+    try:
+        # Get all cache files with their metadata
+        cache_files = []
+        total_size = 0
+
+        for cache_file in DISK_CACHE_DIR.glob("*.safetensors"):
+            try:
+                stat = cache_file.stat()
+                age = current_time - stat.st_mtime
+                size = stat.st_size
+
+                # Delete old files immediately
+                if age > max_age_seconds:
+                    cache_file.unlink()
+                    meta_file = cache_file.with_suffix(".json")
+                    if meta_file.exists():
+                        meta_file.unlink()
+                    deleted_by_age += 1
+                    logger.debug(f"Deleted old cache: {cache_file.name} (age: {age/86400:.1f} days)")
+                else:
+                    cache_files.append({
+                        "path": cache_file,
+                        "meta_path": cache_file.with_suffix(".json"),
+                        "mtime": stat.st_mtime,
+                        "size": size,
+                    })
+                    total_size += size
+
+            except Exception:
+                continue
+
+        # If still over size limit, delete oldest files
+        if total_size > max_size_bytes:
+            # Sort by modification time (oldest first)
+            cache_files.sort(key=lambda x: x["mtime"])
+
+            for cf in cache_files:
+                if total_size <= max_size_bytes:
+                    break
+
+                try:
+                    cf["path"].unlink()
+                    if cf["meta_path"].exists():
+                        cf["meta_path"].unlink()
+                    total_size -= cf["size"]
+                    deleted_by_size += 1
+                    logger.debug(f"Deleted cache for size limit: {cf['path'].name}")
+                except Exception:
+                    continue
+
+        total_size_mb = total_size / (1024 * 1024)
+
+        if deleted_by_age > 0 or deleted_by_size > 0:
+            logger.info(
+                f"Disk cache cleanup: deleted {deleted_by_age} old + {deleted_by_size} for size, "
+                f"remaining: {total_size_mb:.1f}MB"
+            )
+
+        return {
+            "deleted_by_age": deleted_by_age,
+            "deleted_by_size": deleted_by_size,
+            "total_size_mb": round(total_size_mb, 1),
+        }
+
+    except Exception as e:
+        logger.warning(f"Error during disk cache cleanup: {e}")
+        return {"deleted_by_age": 0, "deleted_by_size": 0, "total_size_mb": 0, "error": str(e)}
 
 
 @dataclass
@@ -170,6 +543,11 @@ class SmartPromptCache:
         self.cache_misses = 0
         self.tokens_saved = 0
         self.total_evictions = 0
+        self.disk_cache_hits = 0
+        self.disk_cache_saves = 0
+
+        # Pending disk save (set when a new large slot is created)
+        self._pending_disk_save: Optional[Dict[str, Any]] = None
 
     def _find_best_slot(
         self,
@@ -424,7 +802,88 @@ class SmartPromptCache:
                 else:
                     logger.debug("Cache trim not supported, creating new slot")
 
-        # No good match - create new slot
+        # No good match in memory - check disk cache
+        num_layers = len(model.model.layers)
+
+        # Try to find a disk cache that matches a prefix
+        disk_match = find_disk_cache_by_prefix(model.model_id, prompt_hashes)
+        if disk_match:
+            disk_hash, disk_match_blocks = disk_match
+            disk_matched_tokens = disk_match_blocks * self.block_size
+            disk_matched_tokens = min(disk_matched_tokens, len(prompt) - 1)
+
+            if disk_matched_tokens >= self.min_reuse_tokens:
+                # Try to load from disk
+                disk_result = load_cache_from_disk(model.model_id, disk_hash, num_layers)
+                if disk_result:
+                    loaded_cache, loaded_tokens, loaded_hashes = disk_result
+
+                    # IMPORTANT: Only use the matching portion of the cache!
+                    # The disk cache might have more tokens than actually match the new prompt
+                    actual_cached_tokens = min(disk_matched_tokens, len(loaded_tokens))
+
+                    # If disk cache has more tokens than match, we need to trim
+                    if len(loaded_tokens) > actual_cached_tokens:
+                        if can_trim_prompt_cache(loaded_cache):
+                            trim_amount = len(loaded_tokens) - actual_cached_tokens
+                            try:
+                                trim_prompt_cache(loaded_cache, trim_amount)
+                                loaded_tokens = loaded_tokens[:actual_cached_tokens]
+                                loaded_hashes = loaded_hashes[:disk_match_blocks]
+                                logger.debug(f"Trimmed disk cache by {trim_amount} tokens to match prefix")
+                            except Exception as e:
+                                logger.warning(f"Failed to trim disk cache: {e}")
+                                # Fall through to create new slot instead
+                                loaded_cache = None
+                        else:
+                            logger.debug("Disk cache trim not supported, skipping")
+                            loaded_cache = None
+
+                    if loaded_cache:
+                        # Create a slot from the loaded cache
+                        slot = CacheSlot(
+                            tokens=list(loaded_tokens),
+                            cache=loaded_cache,
+                            block_hashes=loaded_hashes,
+                            last_access=time.time(),
+                            model_key=model.model_id,
+                            hit_count=1,
+                            created_at=time.time(),
+                            total_reuse_tokens=actual_cached_tokens,
+                        )
+
+                        # Generate slot key
+                        first_hash = loaded_hashes[0] if loaded_hashes else 'empty'
+                        last_hash = loaded_hashes[-1] if len(loaded_hashes) > 1 else ''
+                        slot_key = f"{model.model_id}:{first_hash}:{last_hash}"
+
+                        # Evict if at capacity
+                        if len(self.slots) >= self.max_slots:
+                            self._evict_lru_slot()
+
+                        self.slots[slot_key] = slot
+
+                        # Now use this slot like a memory hit
+                        tokens_to_process = prompt[actual_cached_tokens:]
+
+                        # Update slot with new tokens
+                        slot.tokens = list(prompt)
+                        slot.block_hashes = prompt_hashes
+
+                        self.cache_hits += 1
+                        self.disk_cache_hits += 1
+                        self.tokens_saved += actual_cached_tokens
+
+                        disk_elapsed_ms = (time.perf_counter() - start_time) * 1000
+                        reuse_pct = 100 * actual_cached_tokens / len(prompt)
+                        logger.info(
+                            f"DISK Cache HIT: reusing {actual_cached_tokens}/{len(prompt)} tokens "
+                            f"({reuse_pct:.1f}% cached) in {disk_elapsed_ms:.0f}ms"
+                        )
+
+                        return tokens_to_process, actual_cached_tokens, slot.cache
+
+        # No disk cache either - create new slot
         self.cache_misses += 1
         logger.info(
             f"Cache MISS: creating new slot for {len(prompt)} tokens "
@@ -433,6 +892,16 @@ class SmartPromptCache:
         )
 
         slot = self._create_slot(model, prompt, prompt_hashes)
+
+        # Schedule disk save for large prompts (will happen after prefill completes)
+        if len(prompt) >= DISK_CACHE_MIN_TOKENS:
+            self._pending_disk_save = {
+                "cache": slot.cache,
+                "tokens": list(prompt),
+                "model_id": model.model_id,
+                "block_hashes": prompt_hashes,
+            }
+
         return prompt, 0, slot.cache
 
     def extend_cache(self, completion_tokens: List[int]):
@@ -485,6 +954,31 @@ class SmartPromptCache:
         """Alias for extend_cache for API compatibility."""
         self.extend_cache(completion_tokens)
 
+    def flush_pending_disk_save(self):
+        """
+        Save pending KV cache to disk.
+
+        This should be called after the prefill is complete and the KV cache
+        has been populated with the actual computed values.
+        """
+        if self._pending_disk_save is None:
+            return
+
+        pending = self._pending_disk_save
+        self._pending_disk_save = None
+
+        try:
+            result = save_cache_to_disk(
+                cache=pending["cache"],
+                tokens=pending["tokens"],
+                model_id=pending["model_id"],
+                block_hashes=pending["block_hashes"],
+            )
+            if result:
+                self.disk_cache_saves += 1
+        except Exception as e:
+            logger.warning(f"Failed to save pending disk cache: {e}")
+
     def get_stats(self) -> Dict[str, Any]:
         """Get detailed cache statistics."""
         active_slots_info = []
@@ -509,6 +1003,13 @@ class SmartPromptCache:
             "active_slots": len(self.slots),
             "max_slots": self.max_slots,
             "slots_detail": active_slots_info,
+            "disk_cache": {
+                "enabled": DISK_CACHE_ENABLED,
+                "hits": self.disk_cache_hits,
+                "saves": self.disk_cache_saves,
+                "min_tokens": DISK_CACHE_MIN_TOKENS,
+                "directory": str(DISK_CACHE_DIR),
+            },
             "config": {
                 "block_size": self.block_size,
                 "min_reuse_tokens": self.min_reuse_tokens,

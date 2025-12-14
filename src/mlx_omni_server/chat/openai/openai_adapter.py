@@ -248,102 +248,62 @@ class OpenAIAdapter:
                 else:
                     content = ""
 
-                # Smart buffering to hide tool call XML
-                if content and not in_tool_call:
+                # Buffer content to detect tool call markers
+                if not in_tool_call:
                     buffer += content
 
-                    # Check if we've started a tool call
+                    # Check if buffer contains start of tool call
                     for marker in TOOL_MARKERS:
                         if marker in buffer:
                             in_tool_call = True
-                            # Send any content before the marker
-                            marker_pos = buffer.find(marker)
-                            if marker_pos > 0:
-                                pre_marker = buffer[:marker_pos]
-                                message = ChatMessage(role=Role.ASSISTANT, content=pre_marker)
-                                yield ChatCompletionChunk(
-                                    id=chat_id,
-                                    created=created,
-                                    model=request.model,
-                                    choices=[
-                                        ChatCompletionChunkChoice(
-                                            index=0,
-                                            delta=message,
-                                            finish_reason=None,
-                                            logprobs=chunk.logprobs,
-                                        )
-                                    ],
-                                )
-                            buffer = ""
+                            buffer = ""  # Clear buffer, don't stream tool call content
                             break
 
-                    # If not in tool call and buffer is long enough, flush safe content
+                    # If not in tool call, yield buffered content (keeping some for marker detection)
                     if not in_tool_call and len(buffer) > MAX_MARKER_LEN:
-                        # Keep the last MAX_MARKER_LEN chars in buffer for marker detection
-                        safe_content = buffer[:-MAX_MARKER_LEN]
+                        to_yield = buffer[:-MAX_MARKER_LEN]
                         buffer = buffer[-MAX_MARKER_LEN:]
 
-                        # Check if safe_content has '<' that could be start of tool marker
-                        # Move everything from last '<' onward back to buffer
-                        # But don't buffer <think> or </think> tags - let them through for reasoning display
-                        last_angle = safe_content.rfind('<')
-                        if last_angle >= 0:
-                            potential_tag = safe_content[last_angle:]
-                            # Allow thinking tags to pass through immediately
-                            if not (potential_tag.startswith('<think') or potential_tag.startswith('</think')):
-                                buffer = safe_content[last_angle:] + buffer
-                                safe_content = safe_content[:last_angle]
-
-                        if safe_content:
-                            message = ChatMessage(role=Role.ASSISTANT, content=safe_content)
-                            yield ChatCompletionChunk(
-                                id=chat_id,
-                                created=created,
-                                model=request.model,
-                                choices=[
-                                    ChatCompletionChunkChoice(
-                                        index=0,
-                                        delta=message,
-                                        finish_reason=None,
-                                        logprobs=chunk.logprobs,
-                                    )
-                                ],
-                            )
+                        message = ChatMessage(role=Role.ASSISTANT, content=to_yield)
+                        yield ChatCompletionChunk(
+                            id=chat_id,
+                            created=created,
+                            model=request.model,
+                            choices=[
+                                ChatCompletionChunkChoice(
+                                    index=0,
+                                    delta=message,
+                                    finish_reason=None,
+                                    logprobs=chunk.logprobs,
+                                )
+                            ],
+                        )
 
                 result = chunk
 
-            # Flush remaining buffer if no tool call was detected
-            # But don't flush if buffer looks like start of tool call (starts with '<')
-            # Always flush thinking tags though
+            # Flush remaining buffer if not in tool call
             if buffer and not in_tool_call:
-                # Check if buffer might be incomplete tool call (but not thinking tags)
-                stripped_buffer = buffer.strip()
-                is_thinking_tag = stripped_buffer.startswith('<think') or stripped_buffer.startswith('</think')
-                is_potential_tool_call = not is_thinking_tag and stripped_buffer.startswith('<') and any(
-                    stripped_buffer.startswith(m[:len(stripped_buffer)])
-                    for m in TOOL_MARKERS
+                message = ChatMessage(role=Role.ASSISTANT, content=buffer)
+                yield ChatCompletionChunk(
+                    id=chat_id,
+                    created=int(time.time()),
+                    model=request.model,
+                    choices=[
+                        ChatCompletionChunkChoice(
+                            index=0,
+                            delta=message,
+                            finish_reason=None,
+                            logprobs=None,
+                        )
+                    ],
                 )
-                if not is_potential_tool_call:
-                    message = ChatMessage(role=Role.ASSISTANT, content=buffer)
-                    yield ChatCompletionChunk(
-                        id=chat_id,
-                        created=int(time.time()),
-                        model=request.model,
-                        choices=[
-                            ChatCompletionChunkChoice(
-                                index=0,
-                                delta=message,
-                                finish_reason=None,
-                                logprobs=None,
-                            )
-                        ],
-                    )
 
             # After streaming completes, emit final chunk with finish_reason
             # Check for tool calls in accumulated text
             tool_calls = None
             final_finish_reason = "stop"
 
+            # XML-formatted tool calls (Qwen3, Qwen3-MoE, etc.)
             if accumulated_text and ('<function=' in accumulated_text or '<tool_call>' in accumulated_text):
                 from mlx_omni_server.chat.mlx.tools.qwen3_moe_tools_parser import Qwen3MoeToolParser
                 import json as json_module
@@ -365,8 +325,32 @@ class OpenAIAdapter:
                     ]
                     final_finish_reason = "tool_calls"
 
+            # FALLBACK: Bare JSON tool calls (Qwen 2.5, etc.)
+            # Only attempt if: 1) no XML tool calls found, 2) tools were in request, 3) text has tool-like JSON
+            has_tools_in_request = request.tools is not None and len(request.tools) > 0
+            if tool_calls is None and has_tools_in_request and accumulated_text:
+                if '"name"' in accumulated_text and ('"arguments"' in accumulated_text or '"parameters"' in accumulated_text):
+                    from mlx_omni_server.chat.mlx.tools.base_tools import extract_tools
+                    import json as json_module
+                    from .schema import ToolCall as SchemaToolCall, FunctionCall, ToolType
+
+                    parsed_tools = extract_tools(accumulated_text)
+                    if parsed_tools:
+                        tool_calls = [
+                            SchemaToolCall(
+                                id=tc.id,
+                                type=ToolType.FUNCTION,
+                                function=FunctionCall(
+                                    name=tc.name,
+                                    arguments=json_module.dumps(tc.arguments) if tc.arguments else "{}"
+                                )
+                            )
+                            for tc in parsed_tools
+                        ]
+                        final_finish_reason = "tool_calls"
+
             # Always emit a final chunk with finish_reason
-            yield ChatCompletionChunk(
+            final_chunk = ChatCompletionChunk(
                 id=chat_id,
                 created=int(time.time()),
                 model=request.model,
@@ -383,6 +367,7 @@ class OpenAIAdapter:
                     )
                 ],
             )
+            yield final_chunk
 
             if (
                 request.stream_options

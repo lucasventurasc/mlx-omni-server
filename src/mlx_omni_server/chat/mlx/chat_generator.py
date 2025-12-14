@@ -500,6 +500,7 @@ class ChatGenerator:
             # Stream generation
             generated_tokens = []
 
+            gen_idx = 0
             for response in stream_generate(
                 model=self.model.model,
                 tokenizer=self.tokenizer,
@@ -507,15 +508,20 @@ class ChatGenerator:
                 draft_model=self.model.draft_model,
                 **mlx_kwargs,
             ):
+                gen_idx += 1
                 if response.finish_reason is not None:
                     break
-
                 generated_tokens.append(response.token)
 
                 # Record first token time if this is the first token
                 if first_token_time is None:
                     first_token_time = time.perf_counter() - request_start_time
                     logger.info(f"Generating... (TTFT: {first_token_time:.2f}s)")
+
+                    # Save KV cache to disk if there's a pending save
+                    # This happens after prefill when cache has computed values
+                    if enable_prompt_cache:
+                        self.prompt_cache.flush_pending_disk_save()
 
                 # Process logprobs if requested
                 logprobs = None
@@ -555,13 +561,14 @@ class ChatGenerator:
                     time_to_first_token=first_token_time or 0.0,
                 )
 
-                yield GenerationResult(
+                gen_result = GenerationResult(
                     content=content,
                     finish_reason=response.finish_reason,
                     stats=stats,
                     logprobs=logprobs,
                     from_draft=response.from_draft,
                 )
+                yield gen_result
 
             # Extend cache with generated tokens if caching is enabled
             if enable_prompt_cache and generated_tokens:

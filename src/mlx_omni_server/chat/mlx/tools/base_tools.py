@@ -45,8 +45,17 @@ def extract_tools(text: str) -> Optional[List[ToolCall]]:
         try:
             arguments = json.loads(args_str) if args_str else {}
         except json.JSONDecodeError:
-            logger.warning(f"Failed to parse tool arguments as JSON: {args_str}")
-            arguments = {}
+            # Try to fix common JSON issues (unescaped backslashes in regex patterns)
+            if args_str:
+                try:
+                    # Escape unescaped backslashes (but not already escaped ones)
+                    fixed_str = re.sub(r'(?<!\\)\\(?![\\"/bfnrtu])', r'\\\\', args_str)
+                    arguments = json.loads(fixed_str)
+                except json.JSONDecodeError:
+                    logger.warning(f"Failed to parse tool arguments as JSON: {args_str}")
+                    arguments = {}
+            else:
+                arguments = {}
 
         # Create CoreToolCall object directly
         tool_call = ToolCall(

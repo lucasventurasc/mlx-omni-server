@@ -57,39 +57,24 @@ async def create_chat_completion(request: ChatCompletionRequest):
         completion = await asyncio.to_thread(generate_with_lock)
         return JSONResponse(content=completion.model_dump(exclude_none=True))
 
-    # For streaming, use a queue to pass chunks from sync generator to async
+    # For streaming, collect all chunks synchronously then yield
     async def async_event_generator() -> AsyncGenerator[str, None]:
-        chunk_queue = queue.Queue()
-        done_sentinel = object()
-
-        def sync_generator():
-            # Hold lock during entire generation to prevent concurrent GPU access
+        def generate_all_chunks():
+            """Generate all chunks synchronously while holding lock"""
+            chunks = []
             with mlx_generation_lock:
-                try:
-                    for chunk in text_model.generate_stream(request):
-                        chunk_queue.put(chunk)
-                finally:
-                    chunk_queue.put(done_sentinel)
+                for chunk in text_model.generate_stream(request):
+                    chunks.append(chunk)
+            return chunks
 
-        # Start sync generator in background thread
-        thread = threading.Thread(target=sync_generator, daemon=True)
-        thread.start()
+        # Run generation in thread pool to not block event loop
+        all_chunks = await asyncio.to_thread(generate_all_chunks)
 
-        # Yield chunks as they arrive (non-blocking)
-        while True:
-            try:
-                # Poll queue with small timeout to stay async-friendly
-                chunk = await asyncio.to_thread(chunk_queue.get, timeout=0.1)
-                if chunk is done_sentinel:
-                    break
-                yield f"data: {json.dumps(chunk.model_dump(exclude_none=True))}\n\n"
-            except queue.Empty:
-                # No chunk yet, yield control to event loop
-                await asyncio.sleep(0)
-                continue
+        for chunk in all_chunks:
+            data = chunk.model_dump(exclude_none=True)
+            yield f"data: {json.dumps(data)}\n\n"
 
         yield "data: [DONE]\n\n"
-        thread.join(timeout=1.0)
 
     return StreamingResponse(
         async_event_generator(),
