@@ -105,7 +105,7 @@ def _create_text_model(
     model_id: str,
     adapter_path: Optional[str] = None,
     draft_model: Optional[str] = None,
-    require_loaded: bool = True,
+    require_loaded: bool = False,
 ):
     """Create a text model based on the model parameters.
 
@@ -120,8 +120,8 @@ def _create_text_model(
         model_id: Model name/path
         adapter_path: Optional LoRA adapter path
         draft_model: Optional draft model for speculative decoding
-        require_loaded: If True (default), raise error if model not already loaded.
-                       This prevents concurrent model loading which crashes Metal.
+        require_loaded: If True, raise error if model not already loaded.
+                       If False (default), auto-load the model on demand.
 
     Returns:
         OpenAIAdapter for MLX backend or GGUFOpenAIAdapter for GGUF backend
