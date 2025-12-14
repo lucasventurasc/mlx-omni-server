@@ -594,5 +594,7 @@ class ChatGenerator:
                 logger.info(f"Generation complete: {stats.completion_tokens} tokens @ {stats.generation_tps:.1f} tok/s (TTFT: {stats.time_to_first_token:.2f}s)")
 
         except Exception as e:
+            import traceback
             logger.error(f"Error during stream generation: {e}")
+            logger.error(f"Full traceback:\n{traceback.format_exc()}")
             raise RuntimeError(f"Stream generation failed: {e}")
