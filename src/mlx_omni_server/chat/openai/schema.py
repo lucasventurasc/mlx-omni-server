@@ -146,6 +146,7 @@ class ChatCompletionResponse(BaseModel):
 
 class StreamOptions(BaseModel):
     include_usage: bool = False
+    include_thinking: bool = False  # Whether to stream thinking content (for UI) or filter it (for agents)
 
 
 class JsonSchemaFormat(BaseModel):

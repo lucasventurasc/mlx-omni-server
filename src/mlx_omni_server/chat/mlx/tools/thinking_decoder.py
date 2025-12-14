@@ -23,7 +23,7 @@ class ThinkingDecoder:
         if text == thinking_end_tag:
             self.accumulated_text += text
             return {
-                "delta_content": "",
+                "delta_content": None,  # None signals transition state (skip chunk)
                 "delta_thinking": None,
             }
 
@@ -40,9 +40,12 @@ class ThinkingDecoder:
             return {"delta_content": None, "delta_thinking": text}
         # If current delta contains the end tag (from not having it to having it)
         elif not has_end_tag_before and has_end_tag_now:
-            # Split the current delta
-            parts = text.split(thinking_end_tag, 1)
-            return {"delta_content": "", "delta_thinking": None}
+            # Extract content after the end tag from accumulated text
+            # This handles cases where </think> spans multiple chunks
+            end_idx = self.accumulated_text.find(thinking_end_tag)
+            content_after = self.accumulated_text[end_idx + len(thinking_end_tag):]
+            # Return None if no content yet (empty string triggers fallback to response.text)
+            return {"delta_content": content_after if content_after else None, "delta_thinking": None}
         # If end tag was already encountered before
         elif has_end_tag_before:
             # All content after the end tag is content

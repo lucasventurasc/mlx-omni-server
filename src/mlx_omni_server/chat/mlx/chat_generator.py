@@ -544,12 +544,23 @@ class ChatGenerator:
                         token=response.token,
                         chunk_index=chunk_index,
                     )
-                else:
+                elif parse_result.content is not None:
+                    # We have actual content to stream
                     content = StreamContent(
-                        text_delta=parse_result.content or response.text,
+                        text_delta=parse_result.content,
                         token=response.token,
                         chunk_index=chunk_index,
                     )
+                elif self.chat_template.reason_decoder is None:
+                    # No thinking mode - fall back to raw response text
+                    content = StreamContent(
+                        text_delta=response.text,
+                        token=response.token,
+                        chunk_index=chunk_index,
+                    )
+                else:
+                    # Thinking mode transition - no content yet, skip this chunk
+                    continue
 
                 stats = GenerationStats(
                     prompt_tokens=response.prompt_tokens,

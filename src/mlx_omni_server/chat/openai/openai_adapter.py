@@ -236,17 +236,36 @@ class OpenAIAdapter:
             TOOL_MARKERS = ['<tool_call>', '<function=']
             MAX_MARKER_LEN = max(len(m) for m in TOOL_MARKERS)
 
+            # Check if thinking should be streamed (for UI) or filtered (for agents)
+            include_thinking = (
+                request.stream_options.include_thinking
+                if request.stream_options
+                else False
+            )
+
             for chunk in self._generate_wrapper.generate_stream(**params):
                 created = int(time.time())
 
                 # For streaming, get the delta content
+                # reasoning_delta contains thinking content, text_delta contains actual response
                 if chunk.content.text_delta:
                     content = chunk.content.text_delta
                     accumulated_text += content
                 elif chunk.content.reasoning_delta:
-                    content = chunk.content.reasoning_delta
+                    if include_thinking:
+                        # Stream thinking content (for UI clients like Crush)
+                        content = chunk.content.reasoning_delta
+                    else:
+                        # Skip thinking content (for agent tools)
+                        result = chunk
+                        continue
                 else:
                     content = ""
+
+                # Skip empty content
+                if not content:
+                    result = chunk
+                    continue
 
                 # Buffer content to detect tool call markers
                 if not in_tool_call:

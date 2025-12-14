@@ -185,7 +185,8 @@ class ChatTemplate(ABC):
 
         if self.reason_decoder is not None:
             result = self.reason_decoder.stream_decode(text)
-            delta_content = result.get("delta_content") or ""
+            # Preserve None to signal "no content yet" (thinking mode transition)
+            delta_content = result.get("delta_content")
             delta_thinking = result.get("delta_thinking")
 
         # TODO: support stream parse tools
