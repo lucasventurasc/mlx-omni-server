@@ -71,6 +71,16 @@ IMPORTANT TOOL USE GUIDELINES:
 6. For Edit: old_string must match EXACTLY (including whitespace)
 """
 
+        def sanitize_system_prompt(content: str) -> str:
+            """Remove Claude-specific identity to avoid confusing local models."""
+            import re
+            # Replace "Claude" identity with generic assistant
+            content = re.sub(r'\bClaude\b(?! Code)', 'Assistant', content)
+            content = re.sub(r'\bAnthropic\b', 'the developer', content)
+            content = re.sub(r'You are Claude[^.]*\.', 'You are a helpful coding assistant.', content)
+            content = re.sub(r'made by Anthropic[^.]*\.', '', content)
+            return content
+
         # Convert system prompt to system message if present
         if system:
             system_content = ""
@@ -79,6 +89,9 @@ IMPORTANT TOOL USE GUIDELINES:
             else:
                 # List of SystemTextBlock
                 system_content = "\n".join(block.text for block in system)
+
+            # Sanitize Claude-specific identity (helps local models not get confused)
+            system_content = sanitize_system_prompt(system_content)
 
             # Prepend tool guidance to system prompt
             system_content = tool_guidance + "\n\n" + system_content

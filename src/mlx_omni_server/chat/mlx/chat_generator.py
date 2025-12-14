@@ -253,11 +253,19 @@ class ChatGenerator:
         Returns:
             Dictionary of kwargs for mlx-lm generate functions
         """
-        # Core MLX parameters
+        # Core MLX parameters - read from env vars with sensible defaults
+        import os
+        prefill_step_size = int(os.environ.get("MLX_PREFILL_STEP_SIZE", "8192"))
+        kv_bits = os.environ.get("MLX_KV_BITS")  # None = no quantization, 8 = faster with large context
+
         mlx_kwargs = {
             "max_tokens": max_tokens,
-            "prefill_step_size": 4096,  # Larger step size for faster prefill on M2 Ultra
+            "prefill_step_size": prefill_step_size,
         }
+
+        # Add KV cache quantization if configured (speeds up large context generation)
+        if kv_bits is not None:
+            mlx_kwargs["kv_bits"] = int(kv_bits)
 
         # Handle sampler parameter
         if sampler is not None:
@@ -558,6 +566,10 @@ class ChatGenerator:
             # Extend cache with generated tokens if caching is enabled
             if enable_prompt_cache and generated_tokens:
                 self.prompt_cache.extend_completion_cache(generated_tokens)
+
+            # Log final generation stats
+            if stats:
+                logger.info(f"Generation complete: {stats.completion_tokens} tokens @ {stats.generation_tps:.1f} tok/s (TTFT: {stats.time_to_first_token:.2f}s)")
 
         except Exception as e:
             logger.error(f"Error during stream generation: {e}")

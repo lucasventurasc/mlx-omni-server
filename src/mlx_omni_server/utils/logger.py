@@ -25,27 +25,19 @@ def get_logger(name: Optional[str] = None) -> logging.Logger:
     # Create console with no file/line highlighting
     console = Console(highlight=False)
 
-    # Custom time formatter that only shows time (no date)
-    def time_formatter():
-        return Text(
-            datetime.now().strftime("%H:%M:%S"), style="bold"
-        )  # Only show hours:minutes:seconds
-
     # Configure Rich handler with custom settings
     rich_handler = RichHandler(
         console=console,
-        show_time=False,  # Disable default time display
+        show_time=True,
         show_level=True,
-        show_path=False,  # Hide file path
-        enable_link_path=False,  # Disable clickable links
+        show_path=False,
+        enable_link_path=False,
         markup=True,
         rich_tracebacks=True,
         tracebacks_extra_lines=2,
         tracebacks_show_locals=True,
+        log_time_format="%H:%M:%S.%f",  # Include microseconds for performance comparison
     )
-
-    # Set custom time display function
-    rich_handler.get_time = time_formatter
 
     # Set log format to only include the message
     # Rich handler will add timestamps and log levels automatically

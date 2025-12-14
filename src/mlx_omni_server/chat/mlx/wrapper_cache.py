@@ -262,6 +262,33 @@ class MLXWrapperCache:
 
             return evicted_count
 
+    def remove_model(self, model_id: str) -> bool:
+        """Remove a specific model from the cache.
+
+        Args:
+            model_id: Model path/ID to remove
+
+        Returns:
+            True if model was found and removed, False otherwise
+        """
+        with self._lock:
+            # Find and remove any cache entry matching this model_id
+            keys_to_remove = [
+                key for key in self._cache.keys()
+                if key.model_id == model_id
+            ]
+
+            if not keys_to_remove:
+                logger.info(f"Model not in cache: {model_id}")
+                return False
+
+            for key in keys_to_remove:
+                self._cache.pop(key, None)
+                self._access_times.pop(key, None)
+                logger.info(f"Removed model from cache: {key}")
+
+            return True
+
     def clear_cache(self) -> None:
         """Clear all cached wrapper instances.
 

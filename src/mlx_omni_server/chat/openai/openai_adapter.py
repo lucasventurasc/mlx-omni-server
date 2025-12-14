@@ -68,6 +68,14 @@ class OpenAIAdapter:
             if key in extra_params:
                 template_kwargs[key] = extra_params[key]
 
+        # Default: disable thinking for faster responses (saves ~3K tokens per request)
+        # Client can override by explicitly setting enable_thinking=True
+        if "enable_thinking" not in template_kwargs:
+            template_kwargs["enable_thinking"] = False
+            logger.info("enable_thinking not specified by client, defaulting to False")
+        else:
+            logger.info(f"enable_thinking from client: {template_kwargs['enable_thinking']}")
+
         # Convert messages to dict format
         messages = []
         for msg in request.messages:
