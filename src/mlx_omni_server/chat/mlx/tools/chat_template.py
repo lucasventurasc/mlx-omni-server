@@ -180,6 +180,10 @@ class ChatTemplate(ABC):
         return prompt
 
     def stream_parse_chat_result(self, text: str) -> ChatTemplateResult:
+        # Guard against None text
+        if text is None:
+            return ChatTemplateResult(content=None, thinking=None)
+
         delta_content = text
         delta_thinking = None
 

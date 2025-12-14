@@ -530,6 +530,10 @@ class ChatGenerator:
                         response, top_logprobs
                     )
 
+                # Guard against None response.text
+                if response.text is None:
+                    continue
+
                 parse_result = self.chat_template.stream_parse_chat_result(
                     response.text
                 )

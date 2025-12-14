@@ -7,7 +7,8 @@ class ThinkingDecoder:
 
     def __init__(self, thinking_tag: str = "think", init_buffer: str = ""):
         self.thinking_tag = thinking_tag
-        self.accumulated_text = init_buffer
+        # Guard against None init_buffer
+        self.accumulated_text = init_buffer if init_buffer is not None else ""
 
     def _parse_stream_response(self, text: str) -> Optional[Dict[str, Any]]:
         # Guard against None or empty text
