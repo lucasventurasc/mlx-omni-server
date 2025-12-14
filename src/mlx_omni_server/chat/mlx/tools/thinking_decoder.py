@@ -10,6 +10,10 @@ class ThinkingDecoder:
         self.accumulated_text = init_buffer
 
     def _parse_stream_response(self, text: str) -> Optional[Dict[str, Any]]:
+        # Guard against None or empty text
+        if text is None or text == "":
+            return {"delta_content": None, "delta_thinking": None}
+
         # Check if in thinking mode
         thinking_end_tag = f"</{self.thinking_tag}>"
         thinking_start_tag = f"<{self.thinking_tag}>"
@@ -59,6 +63,10 @@ class ThinkingDecoder:
         return self._parse_stream_response(text)
 
     def _parse_response(self, response: str):
+        # Guard against None or empty response
+        if response is None or response == "":
+            return {"content": "", "thinking": None}
+
         tag = self.thinking_tag
         # First check for complete thinking tag pattern
         thinking_regex = rf"<{tag}>([\s\S]*?)</{tag}>"
