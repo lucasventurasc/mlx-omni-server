@@ -82,7 +82,8 @@ class OpenAIAdapter:
             role = msg.role.value if hasattr(msg.role, "value") else str(msg.role)
             msg_dict = {
                 "role": role,
-                "content": msg.content,
+                # Ensure content is never None - Jinja templates use 'in' operator on content
+                "content": msg.content if msg.content is not None else "",
             }
             if msg.name:
                 msg_dict["name"] = msg.name
@@ -92,7 +93,13 @@ class OpenAIAdapter:
                 import json as json_module
                 tool_calls_list = []
                 for tc in msg.tool_calls:
+                    # Skip None or invalid tool calls
+                    if tc is None:
+                        continue
                     tc_dict = tc.model_dump(mode='json') if hasattr(tc, "model_dump") else (dict(tc) if hasattr(tc, "__dict__") else tc)
+                    # Skip if conversion failed (not a dict)
+                    if not isinstance(tc_dict, dict):
+                        continue
                     # Parse arguments JSON string to dict if needed
                     if 'function' in tc_dict and isinstance(tc_dict['function'].get('arguments'), str):
                         try:

@@ -43,6 +43,15 @@ def load_mlx_model(
         )
         logger.info(f"Loaded model: {model_id}")
 
+        # Ensure eos_token_ids is never None (fixes "argument of type 'NoneType' is not iterable" in mlx_lm)
+        if tokenizer.eos_token_ids is None:
+            if hasattr(tokenizer, 'eos_token_id') and tokenizer.eos_token_id is not None:
+                tokenizer.eos_token_ids = {tokenizer.eos_token_id}
+                logger.info(f"Set eos_token_ids from eos_token_id: {tokenizer.eos_token_ids}")
+            else:
+                tokenizer.eos_token_ids = set()
+                logger.warning(f"Model {model_id} has no eos_token_ids, using empty set")
+
         # Load configuration and create chat tokenizer
         model_path = get_model_path(model_id)[0]
         config = load_config(model_path)

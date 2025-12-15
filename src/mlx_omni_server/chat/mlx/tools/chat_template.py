@@ -148,6 +148,9 @@ class ChatTemplate(ABC):
         - enable_thinking_parse=True: Extract thinking and content parts using current rules
         - enable_thinking_parse=False: No modification to prompt
         """
+        # Always reset reason_decoder at the start to prevent stale state from previous requests
+        self.reason_decoder = None
+
         enable_thinking_parse = self.enable_thinking_parse
         stripped_prompt = prompt.rstrip()  # Single rstrip call for efficiency
 

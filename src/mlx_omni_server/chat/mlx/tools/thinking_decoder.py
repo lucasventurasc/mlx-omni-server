@@ -11,9 +11,13 @@ class ThinkingDecoder:
         self.accumulated_text = init_buffer if init_buffer is not None else ""
 
     def _parse_stream_response(self, text: str) -> Optional[Dict[str, Any]]:
-        # Guard against None or empty text
-        if text is None or text == "":
+        # Guard against None, empty text, or non-string input
+        if text is None or text == "" or not isinstance(text, str):
             return {"delta_content": None, "delta_thinking": None}
+
+        # Ensure accumulated_text is always a string (defensive guard)
+        if self.accumulated_text is None:
+            self.accumulated_text = ""
 
         # Check if in thinking mode
         thinking_end_tag = f"</{self.thinking_tag}>"
