@@ -281,8 +281,32 @@ class OpenAIAdapter:
                     # Check if buffer contains start of tool call
                     for marker in TOOL_MARKERS:
                         if marker in buffer:
+                            # IMPORTANT: Send buffered content BEFORE clearing when tool call detected
+                            # This prevents losing text that came before the tool call marker
+                            if buffer:
+                                # Find where the marker starts
+                                marker_pos = buffer.find(marker)
+
+                                # Send everything BEFORE the marker
+                                if marker_pos > 0:
+                                    to_send = buffer[:marker_pos]
+                                    message = ChatMessage(role=Role.ASSISTANT, content=to_send)
+                                    yield ChatCompletionChunk(
+                                        id=chat_id,
+                                        created=created,
+                                        model=request.model,
+                                        choices=[
+                                            ChatCompletionChunkChoice(
+                                                index=0,
+                                                delta=message,
+                                                finish_reason=None,
+                                                logprobs=chunk.logprobs,
+                                            )
+                                        ],
+                                    )
+
                             in_tool_call = True
-                            buffer = ""  # Clear buffer, don't stream tool call content
+                            buffer = ""  # Now safe to clear buffer
                             break
 
                     # If not in tool call, yield buffered content (keeping some for marker detection)

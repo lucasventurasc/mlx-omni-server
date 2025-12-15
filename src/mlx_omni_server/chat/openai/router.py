@@ -70,11 +70,25 @@ async def create_chat_completion(request: ChatCompletionRequest):
         # Run generation in thread pool to not block event loop
         all_chunks = await asyncio.to_thread(generate_all_chunks)
 
-        for chunk in all_chunks:
-            data = chunk.model_dump(exclude_none=True)
-            yield f"data: {json.dumps(data)}\n\n"
+        import logging
+        logger = logging.getLogger("mlx-studio.router")
+        logger.info(f"[ROUTER] Yielding {len(all_chunks)} chunks to client")
 
+        chunk_count = 0
+        for chunk in all_chunks:
+            chunk_count += 1
+            data = chunk.model_dump(exclude_none=True)
+            chunk_str = f"data: {json.dumps(data)}\n\n"
+
+            # Log last 3 chunks with more detail
+            if chunk_count >= len(all_chunks) - 2:
+                logger.warning(f"[ROUTER] Chunk {chunk_count}/{len(all_chunks)}: {chunk_str[:200]}...")
+
+            yield chunk_str
+
+        logger.warning("[ROUTER] Sending DONE marker to client")
         yield "data: [DONE]\n\n"
+        logger.warning("[ROUTER] Stream complete - all data sent")
 
     return StreamingResponse(
         async_event_generator(),
